@@ -1,0 +1,2 @@
+import {z} from 'zod';
+export function analyzeEmails(values:unknown[]){const emails:string[]=[];const seen=new Set<string>();let invalid=0,duplicates=0,empty=0;for(const raw of values){const value=String(raw??'').trim().toLowerCase();if(!value){empty++;continue;}if(!z.string().email().max(254).safeParse(value).success){invalid++;continue;}if(seen.has(value)){duplicates++;continue;}seen.add(value);emails.push(value);}return {emails,invalid,duplicates,empty};}

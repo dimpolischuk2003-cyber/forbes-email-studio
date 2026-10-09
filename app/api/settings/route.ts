@@ -1,0 +1,5 @@
+export const runtime='nodejs';
+import {actor,saveConfig,json,failure,payload,AppError} from '@/lib/server';
+import {z} from 'zod';
+const schema=z.object({senderName:z.string().trim().min(1).max(100).refine(s=>!/[<>"\r\n]/.test(s)),senderEmail:z.string().email().max(200).or(z.literal('')),testEmail:z.string().email().max(200).or(z.literal('')),address:z.string().trim().max(500),unsubscribe:z.string().max(2000).refine(v=>!v||v.startsWith('https://')),accountTimezone:z.string().max(100).refine(v=>{try{new Intl.DateTimeFormat('uk',{timeZone:v});return true;}catch{return false;}}),timezoneConfirmed:z.boolean(),enabled:z.boolean(),subscriptionsKeys:z.array(z.string().max(100)).max(20)});
+export async function POST(request:Request){try{const u=await actor(request);const b=await payload(request);if(b.apiKey)throw new AppError('API-ключ задається у Vercel, змініть ESPUTNIK_API_KEY.');const c=schema.parse(b.config);if(!c.testEmail)c.testEmail=u.email;await saveConfig(u.email,c);return json({connected:!!process.env.ESPUTNIK_API_KEY});}catch(e){return failure(e);}}
