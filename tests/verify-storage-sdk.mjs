@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {createHash} from 'node:crypto';
 import {build} from 'esbuild';
 import {mkdir,rm} from 'node:fs/promises';
 import {pathToFileURL} from 'node:url';
@@ -19,7 +20,7 @@ process.env.VERCEL_BLOB_API_URL='https://blob-api.test.invalid';process.env.VERC
 const token=['eyJhbGciOiJub25lIn0',Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+3600})).toString('base64url'),'test'].join('.');
 const contextKey=Symbol.for('@vercel/request-context');globalThis[contextKey]={get:()=>({headers:{'x-vercel-oidc-token':token}})};
 const originalDispatcher=getGlobalDispatcher(),agent=new MockAgent();agent.disableNetConnect();setGlobalDispatcher(agent);
-const files=new Map();let clock=0,apiPuts=0,denyWrites=false,loseAck=false,conflict=false,omitEtag=false;
+const files=new Map();let clock=0,apiPuts=0,denyWrites=false,loseAck=false,conflict=false,omitEtag=false,variantEtags=false,raceOnRead=false,continuousRace=false,digestEtags=false,staleDownload=null;
 function headersOf(value){if(Array.isArray(value)){const result=new Headers();for(let i=0;i<value.length;i+=2)result.set(value[i],value[i+1]);return result;}return new Headers(value);}
 function response(statusCode,data,headers={}){return {statusCode,data:typeof data==='string'?data:JSON.stringify(data),responseOptions:{headers:{'content-type':'application/json',...headers}}};}
 function error(code,statusCode=412){return response(statusCode,{error:{code}});}
@@ -31,15 +32,23 @@ agent.get('https://blob-api.test.invalid').intercept({path:/.*/,method:'PUT'}).r
  if(conflict&&previous){conflict=false;previous.etag='"'+(++clock)+'"';return error('precondition_failed');}
  if(previous&&(headers.get('x-allow-overwrite')!=='1'||(ifMatch&&ifMatch!==previous.etag)))return error('precondition_failed');
  assert.equal(headers.get('x-add-random-suffix'),'0');
- const body=typeof options.body==='string'?options.body:Buffer.from(options.body).toString();const etag='"'+(++clock)+'"';files.set(pathname,{body,etag});
+ const body=typeof options.body==='string'?options.body:Buffer.from(options.body).toString();const etag=digestEtags?'"'+createHash('md5').update(body).digest('hex')+'"':'"'+(++clock)+'"';files.set(pathname,{body,etag});
  if(loseAck){loseAck=false;return error('service_unavailable',503);}
  return response(200,{url:'https://sdk.private.blob.vercel-storage.com/'+pathname,downloadUrl:'https://sdk.private.blob.vercel-storage.com/'+pathname+'?download=1',pathname,contentType:'application/json',contentDisposition:'attachment',etag});
+}).persist();
+agent.get('https://blob-api.test.invalid').intercept({path:/.*/,method:'GET'}).reply(options=>{
+ const url=new URL(options.path,'https://blob-api.test.invalid'),pathname=url.searchParams.get('url');const file=files.get(pathname);
+ if(!file)return error('not_found',404);
+ if(continuousRace)file.etag='"'+(++clock)+'"';
+ return response(200,{url:'https://sdk.private.blob.vercel-storage.com/'+pathname,pathname,size:Buffer.byteLength(file.body),etag:file.etag,uploadedAt:new Date().toISOString(),contentType:'application/json',contentDisposition:'attachment',cacheControl:'private'});
 }).persist();
 agent.get('https://sdk.private.blob.vercel-storage.com').intercept({path:/.*/,method:'GET'}).reply(options=>{
  const headers=headersOf(options.headers);assert.equal(headers.get('authorization'),'Bearer '+token);
  const url=new URL(options.path,'https://sdk.private.blob.vercel-storage.com');assert.equal(url.searchParams.get('cache'),'0');
  const file=files.get(decodeURIComponent(url.pathname.slice(1)));if(!file)return response(404,'');
- return response(200,file.body,omitEtag?{}:{etag:file.etag});
+ const download=staleDownload||file;const body=download.body,etag=variantEtags?'W/"'+download.etag.replaceAll('"','')+(digestEtags?'-gzip':'')+'"':download.etag;
+ if(raceOnRead){raceOnRead=false;const state=JSON.parse(file.body);state.operations.push({id:'concurrent-snapshot',kind:'test',status:'saved',data:{},created_at:new Date().toISOString()});file.body=JSON.stringify(state);file.etag='"'+(++clock)+'"';}
+ return response(200,body,omitEtag?{}:{etag});
 }).persist();
 agent.get('https://blob-api.test.invalid').intercept({path:'/delete',method:'POST'}).reply(options=>{
  const body=JSON.parse(String(options.body));for(const path of body.urls)files.delete(path);return response(200,{});
@@ -56,6 +65,19 @@ try{
  await assert.rejects(controlChange(state=>{state.operations.push({id:'denied'});}),error=>error.code==='BLOB_ACCESS_DENIED');
  assert.equal(apiPuts-beforeDenied,1);denyWrites=false;
  omitEtag=true;await assert.rejects(controlRead(),error=>error.code==='BLOB_ETAG_MISSING');omitEtag=false;
+ variantEtags=true;
+ await controlChange(state=>{state.operations.push({id:'legacy-variant',kind:'test',status:'saved',data:{},created_at:new Date().toISOString()});});
+ assert.equal((await controlRead()).state.operations.filter(o=>o.id==='legacy-variant').length,1);
+ raceOnRead=true;await controlChange(state=>{state.operations.push({id:'after-snapshot-race',kind:'test',status:'saved',data:{},created_at:new Date().toISOString()});});
+ assert.ok((await controlRead()).state.operations.some(o=>o.id==='concurrent-snapshot'));
+ digestEtags=true;for(const file of files.values())file.etag='"'+createHash('md5').update(file.body).digest('hex')+'"';
+ await controlChange(state=>{state.operations.push({id:'digest-variant',kind:'test',status:'saved',data:{},created_at:new Date().toISOString()});});
+ const controlPath=[...files.keys()].find(path=>path.endsWith('/control.json')),current=files.get(controlPath);
+ staleDownload={...current};current.body=current.body.replace('digest-variant','digest-variAnt');current.etag='"'+createHash('md5').update(current.body).digest('hex')+'"';
+ const beforeStale=apiPuts;await assert.rejects(controlChange(()=>{}),e=>e.code==='BLOB_VERSION_MISMATCH');assert.equal(apiPuts,beforeStale);staleDownload=null;
+ const beforeContinuous=apiPuts;continuousRace=true;
+ await assert.rejects(controlChange(()=>{}),e=>e.code==='BLOB_SNAPSHOT_CHANGED');continuousRace=false,digestEtags=false,staleDownload=null;
+ assert.equal(apiPuts,beforeContinuous);
  const beforeProbe=[...files.entries()];assert.equal((await probeStorage()).ok,true);assert.deepEqual([...files.entries()],beforeProbe);
- console.log((minified?'MINIFIED BUNDLE ':'')+'PASS: real Blob SDK HTTP, request-context OIDC, quoted ETags, committed-write acknowledgement loss, conditional-write conflict, fatal access errors, missing ETag, isolated diagnostic probe and cleanup.');
+ console.log((minified?'MINIFIED BUNDLE ':'')+'PASS: real Blob SDK HTTP, request-context OIDC, quoted ETags, committed-write acknowledgement loss, conditional-write conflict, fatal access errors, missing ETag, metadata/download ETag variants, snapshot races without lost changes, continuous changes blocked before write, isolated diagnostic probe and cleanup.');
 }finally{setGlobalDispatcher(originalDispatcher);await agent.close();delete globalThis[contextKey];await rm(directory,{recursive:true,force:true});}

@@ -4,7 +4,7 @@ import {rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {randomUUID} from 'node:crypto';
-import {get as sdkBlobGet,BlobPreconditionFailedError,BlobAccessError} from '@vercel/blob';
+import {get as sdkBlobGet,BlobPreconditionFailedError,BlobAccessError,BlobNotFoundError} from '@vercel/blob';
 import {MockAgent,getGlobalDispatcher,setGlobalDispatcher} from 'undici';
 
 // Exercise real handlers/auth/provider adapter/control CAS with an isolated fake provider.
@@ -25,11 +25,12 @@ globalThis.__studioCookies={get:name=>jar.has(name)?{value:jar.get(name)}:undefi
 let blob=null,etag=0,blobDown=false,loseAcknowledgement=false,failFinalize=false,missingEtag=false;
 const probes=new Map();
 globalThis.__studioBlob={
+ async head(path){if(blobDown)throw new Error('offline');const item=path.includes('/diagnostics/')?probes.get(path):(blob===null?null:{body:blob,etag:String(etag)});if(!item)throw new BlobNotFoundError();return {etag:item.etag,size:Buffer.byteLength(item.body)};},
  async get(path,options){assert.equal(options.useCache,false);assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(path.includes('/diagnostics/')){const item=probes.get(path);return item?{statusCode:200,stream:new Response(item.body).body,blob:{etag:item.etag}}:null;}if(blob===null)return null;const captured=blob;const capturedTag=missingEtag?'':String(etag);await Promise.resolve();return {statusCode:200,stream:new Response(captured).body,blob:{etag:capturedTag}};},
  async put(path,body,options){assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(path.includes('/diagnostics/')){const previous=probes.get(path);if(previous&&(!options.allowOverwrite||options.ifMatch!==previous.etag))throw new BlobPreconditionFailedError();const tag=String((previous?.revision||0)+1);probes.set(path,{body,etag:tag,revision:Number(tag)});return {etag:tag};}if(blob!==null&&(!options.allowOverwrite||options.ifMatch!==String(etag)))throw new BlobPreconditionFailedError();if(failFinalize&&Object.keys(JSON.parse(body).records).length>Object.keys(JSON.parse(blob).records).length){failFinalize=false;throw new BlobAccessError();}blob=body;etag++;if(loseAcknowledgement){loseAcknowledgement=false;throw new Error('response lost after commit');}return {etag:String(etag)};},
  async del(path){probes.delete(path);},
 };
-const plugins=[{name:'test-adapters',setup(b){b.onResolve({filter:/^(next\/headers|@vercel\/blob)$/},args=>args.namespace==='studio-test'?{path:args.path,external:true}:{path:args.path,namespace:'studio-test'});b.onLoad({filter:/.*/,namespace:'studio-test'},args=>({contents:args.path==='next/headers'?'export async function cookies(){return globalThis.__studioCookies;}':"export {BlobError,BlobAccessError,BlobStoreNotFoundError,BlobStoreSuspendedError,BlobServiceRateLimited,BlobPreconditionFailedError,BlobContentTypeNotAllowedError,BlobRequestAbortedError,BlobServiceNotAvailable} from '@vercel/blob';export const get=(...a)=>globalThis.__studioBlob.get(...a);export const put=(...a)=>globalThis.__studioBlob.put(...a);export const del=(...a)=>globalThis.__studioBlob.del(...a);",loader:'js'}));}}];
+const plugins=[{name:'test-adapters',setup(b){b.onResolve({filter:/^(next\/headers|@vercel\/blob)$/},args=>args.namespace==='studio-test'?{path:args.path,external:true}:{path:args.path,namespace:'studio-test'});b.onLoad({filter:/.*/,namespace:'studio-test'},args=>({contents:args.path==='next/headers'?'export async function cookies(){return globalThis.__studioCookies;}':"export {BlobNotFoundError,BlobError,BlobAccessError,BlobStoreNotFoundError,BlobStoreSuspendedError,BlobServiceRateLimited,BlobPreconditionFailedError,BlobContentTypeNotAllowedError,BlobRequestAbortedError,BlobServiceNotAvailable} from '@vercel/blob';export const head=(...a)=>globalThis.__studioBlob.head(...a);export const get=(...a)=>globalThis.__studioBlob.get(...a);export const put=(...a)=>globalThis.__studioBlob.put(...a);export const del=(...a)=>globalThis.__studioBlob.del(...a);",loader:'js'}));}}];
 let bundleId=0;
 // Project-local bundles resolve external packages through node_modules.
 const {mkdir}=await import('node:fs/promises');
@@ -99,7 +100,7 @@ try{
  assert.equal((await call(recover.POST,{id:orphanId})).status,409);
  assert.equal((await call(studio.POST,{data:base,token:recoveryToken})).data.id,orphanId);
  missingEtag=true;const etagFailure=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(etagFailure.status,503);assert.match(etagFailure.data.error,/BLOB_ETAG_MISSING/);missingEtag=false;
- const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.2');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
+ const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.3');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
  const beforeTemplates=messages.size;const template=await call(templates.POST,{data:base,name:'Reusable',token:randomUUID()});assert.equal(template.status,201);assert.equal(messages.get(template.data.id).template,true);const original=structuredClone(messages.get(template.data.id));const chosen=await call(remote.POST,{id:template.data.id});assert.equal(chosen.status,200);assert.deepEqual(messages.get(template.data.id),original);assert.equal(messages.size,beforeTemplates+1);
  assert.equal((await call(review.POST,{id})).status,400);
  const tests=await Promise.all([call(test.POST,{id}),call(test2.POST,{id})]);assert.ok(tests.some(x=>x.status===200));assert.equal(testCalls,1);assert.equal((await call(test.POST,{id})).data.already,true);

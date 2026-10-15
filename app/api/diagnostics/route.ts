@@ -11,6 +11,6 @@ export async function POST(request:Request){try{
  await check('eSputnik: бази отримувачів',async()=>{await esputnik(await apiKey(),'/groups?startindex=1&maxrows=1');return 'Читання груп дозволене.';});
  await check('Відправник',async()=>{const {config:f}=await config(user.email);if(!f.senderEmail)throw new AppError('Вкажіть email відправника у налаштуваннях.');return 'Адреса задана. Її підтвердження в eSputnik перевіряється при тестовій відправці.';});
  await check('Blob: запис і версії',async()=>(await probeStorage()).detail);
- await check('Історія кампаній',async()=>{const {state,etag}=await controlRead();return etag?`Історію прочитано. Службових записів: ${Object.keys(state.records).length}.`:'Сховище доступне. Історія ще не створена.';});
+ await check('Історія кампаній',async()=>{const {state,etag,downloadEtagDiffers}=await controlRead({forWrite:true});return etag?`Історію прочитано зі стабільною версією об’єкта. Службових записів: ${Object.keys(state.records).length}. Версії завантаження й об’єкта ${downloadEtagDiffers?'відрізняються — для запису використовується версія об’єкта':'збігаються'}.`:'Сховище доступне. Історія ще не створена.';});
  return json({build:buildInfo(),host:new URL(request.url).host,ok:checks.every(c=>c.ok),checks});
  }catch(e){return failure(e);}}

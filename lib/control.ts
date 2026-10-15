@@ -1,4 +1,4 @@
-import {get,put,del,BlobError,BlobAccessError,BlobStoreNotFoundError,BlobStoreSuspendedError,BlobServiceRateLimited,BlobPreconditionFailedError,BlobContentTypeNotAllowedError,BlobRequestAbortedError,BlobServiceNotAvailable} from '@vercel/blob';
+import {get,put,del,head,BlobNotFoundError,BlobError,BlobAccessError,BlobStoreNotFoundError,BlobStoreSuspendedError,BlobServiceRateLimited,BlobPreconditionFailedError,BlobContentTypeNotAllowedError,BlobRequestAbortedError,BlobServiceNotAvailable} from '@vercel/blob';
 import {createHash} from 'node:crypto';
 import {AppError} from './errors';
 import type {Stats} from './statistics';
@@ -43,24 +43,55 @@ export function storageError(error:unknown,operation='write'):StorageError{
  console.error('studio.storage',JSON.stringify({code,operation,kind:known[kind]?kind:'unknown'}));
  return new StorageError(code,message);
 }
-export async function controlRead(){
+async function readBlob(pathname:string){
+ const result=await get(pathname,{access:'private',useCache:false,headers:{'accept-encoding':'identity'},abortSignal:AbortSignal.timeout(15000)});
+ if(!result)return null;
+ if(result.statusCode!==200||!result.stream)throw new StorageError('BLOB_INVALID_RESPONSE','Сховище повернуло неповну відповідь.');
+ if(!result.blob.etag)throw new StorageError('BLOB_ETAG_MISSING','Сховище не повернуло версію службового файлу. Збереження заблоковано.');
+ return {text:await new Response(result.stream).text(),etag:result.blob.etag};
+}
+/** Pair fresh bytes with the storage API's ETag. Metadata must be stable across
+ * the entire download; a newer HEAD must never be paired with an older body. */
+async function writeSnapshot(pathname:string){
+ for(let attempt=0;attempt<3;attempt++){
+  let before;
+  try{before=await head(pathname,{abortSignal:AbortSignal.timeout(15000)});}
+  catch(e){if(e instanceof BlobNotFoundError)return null;throw e;}
+  if(!before.etag||before.etag.startsWith('W/'))throw new StorageError('BLOB_METADATA_ETAG','Сховище не повернуло версію об’єкта для безпечного запису.');
+  const blob=await readBlob(pathname);if(!blob)continue;
+  let after;
+  try{after=await head(pathname,{abortSignal:AbortSignal.timeout(15000)});}
+  catch(e){if(e instanceof BlobNotFoundError)continue;throw e;}
+  if(before.etag!==after.etag||before.size!==after.size)continue;
+  if(Buffer.byteLength(blob.text)!==after.size)throw new StorageError('BLOB_SNAPSHOT_SIZE','Розмір прочитаної історії не збігається з версією об’єкта. Запис заблоковано.');
+  const opaque=(tag:string)=>tag.replace(/^W\//,'').replace(/^"(.*)"$/,'$1');
+  const version=opaque(after.etag),downloadVersion=opaque(blob.etag);
+  // A weak delivery tag can describe the same object; never send that weak tag
+  // as ifMatch. If the opaque tags differ, require an exact content digest.
+  // Stable HEADs alone are insufficient: a stale download of equal length
+  // must never be paired with a newer object's ETag.
+  const digestMatches=/^[a-f0-9]{32}$/i.test(version)?createHash('md5').update(blob.text).digest('hex')===version.toLowerCase():/^[a-f0-9]{64}$/i.test(version)?createHash('sha256').update(blob.text).digest('hex')===version.toLowerCase():false;
+  if(version!==downloadVersion&&!digestMatches)throw new StorageError('BLOB_VERSION_MISMATCH','Прочитані дані й версія об’єкта не узгоджені. Історію не перезаписано.');
+  return {...blob,etag:after.etag,downloadEtagDiffers:blob.etag!==after.etag};
+ }
+ throw new StorageError('BLOB_SNAPSHOT_CHANGED','Історія змінюється під час читання. Запис заблоковано; спробуйте після завершення інших дій.');
+}
+export async function controlRead(options:{forWrite?:boolean}={}){
  if(!controlAvailable())throw new StorageError('BLOB_NOT_CONFIGURED','Завершіть підключення приватного сховища у Vercel.');
  try{
-  const r=await get(path(),{access:'private',useCache:false,abortSignal:AbortSignal.timeout(15000)});
-  if(!r)return {state:empty(),etag:null};
-  if(r.statusCode!==200||!r.stream)throw new StorageError('BLOB_INVALID_RESPONSE','Сховище повернуло неповну відповідь.');
-  if(!r.blob.etag)throw new StorageError('BLOB_ETAG_MISSING','Сховище не повернуло версію службового файлу. Збереження заблоковано.');
-  const state=await new Response(r.stream).json() as ControlState;
+  const blob=options.forWrite?await writeSnapshot(path()):await readBlob(path());
+  if(!blob)return {state:empty(),etag:null,downloadEtagDiffers:false};
+  const state=JSON.parse(blob.text) as ControlState;
   if(state.version!==1||!state.records||!state.creates||!state.imports||!Array.isArray(state.operations)||(state.writes!==undefined&&(!Array.isArray(state.writes)||state.writes.some(x=>typeof x!=='string'))))throw new StorageError('BLOB_STATE_INVALID','Службовий файл має невірний формат.');
   if(state.binding!==createHash('sha256').update(process.env.ESPUTNIK_API_KEY!).digest('hex'))throw new StorageError('BLOB_ACCOUNT_BINDING','API-ключ змінився. Потрібна перевірка прив’язки історії до кабінету eSputnik.');
-  return {state,etag:r.blob.etag};
+  return {state,etag:blob.etag,downloadEtagDiffers:'downloadEtagDiffers' in blob&&blob.downloadEtagDiffers===true};
  }catch(e){if(e instanceof AppError)throw e;throw storageError(e,'read');}
 }
 /** Only pure local changes belong in this callback: provider calls must run AFTER a successful CAS. */
 export async function controlChange<T>(change:(state:ControlState)=>T):Promise<T>{
  const writeId=crypto.randomUUID();
  for(let attempt=0;attempt<6;attempt++){
-  const {state,etag}=await controlRead();
+  const {state,etag}=await controlRead({forWrite:true});
   if(!state.binding)state.binding=createHash('sha256').update(process.env.ESPUTNIK_API_KEY!).digest('hex');
   const result=change(state);state.operations=state.operations.slice(-200);
   state.writes=[...(state.writes||[]),writeId].slice(-64);
@@ -88,21 +119,22 @@ export async function probeStorage(){
  const options={access:'private' as const,addRandomSuffix:false,contentType:'application/json'};
  let created=false;let stage='створення перевірочного запису';
  try{
-  created=true;await put(probe,JSON.stringify({revision:1}),{...options,allowOverwrite:false,abortSignal:AbortSignal.timeout(15000)});created=true;
+  const padding='x'.repeat(32768);
+  created=true;await put(probe,JSON.stringify({revision:1,padding}),{...options,allowOverwrite:false,abortSignal:AbortSignal.timeout(15000)});created=true;
   stage='читання створеного запису';
-  const first=await get(probe,{access:'private',useCache:false,abortSignal:AbortSignal.timeout(15000)});
-  if(first?.statusCode!==200||!first.stream||!first.blob.etag)throw new StorageError('BLOB_PROBE_READ','Не вдалося прочитати перевірочний запис із його версією.');
-  if((await new Response(first.stream).json()).revision!==1)throw new StorageError('BLOB_STALE_READ','Сховище повернуло застарілі дані.');
+  const first=await writeSnapshot(probe);
+  if(!first)throw new StorageError('BLOB_PROBE_READ','Не вдалося прочитати перевірочний запис із його версією.');
+  if(JSON.parse(first.text).revision!==1)throw new StorageError('BLOB_STALE_READ','Сховище повернуло застарілі дані.');
   stage='оновлення з поточною версією';
-  const next=await put(probe,JSON.stringify({revision:2}),{...options,allowOverwrite:true,ifMatch:first.blob.etag,abortSignal:AbortSignal.timeout(15000)});
+  const next=await put(probe,JSON.stringify({revision:2,padding}),{...options,allowOverwrite:true,ifMatch:first.etag,abortSignal:AbortSignal.timeout(15000)});
   stage='відхилення застарілої версії';
   let rejected=false;
-  try{await put(probe,JSON.stringify({revision:3}),{...options,allowOverwrite:true,ifMatch:first.blob.etag,abortSignal:AbortSignal.timeout(15000)});}
+  try{await put(probe,JSON.stringify({revision:3,padding}),{...options,allowOverwrite:true,ifMatch:first.etag,abortSignal:AbortSignal.timeout(15000)});}
   catch(e){if(e instanceof BlobPreconditionFailedError)rejected=true;else throw e;}
   if(!rejected)throw new StorageError('BLOB_CAS_UNSUPPORTED','Сховище не відхилило запис із застарілою версією.');
   stage='перевірка оновлених даних';
-  const latest=await get(probe,{access:'private',useCache:false,abortSignal:AbortSignal.timeout(15000)});
-  if(latest?.statusCode!==200||!latest.stream||(await new Response(latest.stream).json()).revision!==2||latest.blob.etag!==next.etag)throw new StorageError('BLOB_STALE_READ','Повторне читання не підтвердило останню версію запису.');
+  const latest=await writeSnapshot(probe);
+  if(!latest||JSON.parse(latest.text).revision!==2||latest.etag!==next.etag)throw new StorageError('BLOB_STALE_READ','Повторне читання не підтвердило останню версію запису.');
   return {ok:true,detail:'Читання, створення, оновлення та захист від конфліктів працюють.'};
  }catch(e){const failure=e instanceof AppError?e:storageError(e,'probe');throw new AppError(`Етап: ${stage}. ${failure.message}`,failure.status);}
  finally{if(created)await del(probe,{abortSignal:AbortSignal.timeout(10000)}).catch(()=>console.error('studio.storage',JSON.stringify({code:'BLOB_PROBE_CLEANUP',operation:'probe'})));}
