@@ -12,7 +12,27 @@ export async function readMessage(id:string):Promise<Remote>{messageId.parse(id)
 export async function encodeMessage(c:Campaign,f:Config,template=false){const html=renderEmail(c,f);const meta=sign('editor',{data:c,htmlHash:await hash(html)});return {name:c.name||'Без назви',from:`"${f.senderName}" <${f.senderEmail}>`,subject:c.subject||'Без теми',htmlText:html+`<!--forbes-studio-v2:${meta}-->`,languageCode:'uk',tags:[TAG],subscriptionsKeys:f.subscriptionsKeys,template};}
 export async function decodeMessage(r:Remote){const tokens=Array.from(r.html.matchAll(marker));const html=r.html.replace(marker,'');if(tokens.length===1){const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);if(meta&&meta.htmlHash===await hash(html)){const parsed=campaignSchema.safeParse(meta.data);if(parsed.success&&r.name===(parsed.data.name||'Без назви')&&r.subject===(parsed.data.subject||'Без теми'))return canonicalCampaign(parsed.data);}}
  if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
-export async function listedMessages(search=TAG,start=1){const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=${start}&maxrows=50&search=${encodeURIComponent(search)}`);const rows=Array.isArray(data)?data:(data as {messages?:unknown[]})?.messages;if(!Array.isArray(rows))throw new AppError('eSputnik не повернув список листів.',502);return {rows:rows.map((v:Record<string,unknown>)=>({id:messageId.parse(v.id),name:String(v.name||v.subject||`Лист ${v.id}`),subject:String(v.subject||''),template:v.template===true,updatedAt:typeof v.updatedDate==='string'?v.updatedDate:''})),more:rows.length===50,total:headers.get('TotalCount')};}
+export async function listedMessages(search=TAG,start=1){
+ const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=${start}&maxrows=50&search=${encodeURIComponent(search)}`);
+ const rows=Array.isArray(data)?data:(data as {messages?:unknown[]}|null)?.messages;
+ if(!Array.isArray(rows)){
+  // A draft has already been read back and recorded before the editor refreshes
+  // this search. A missing search result must not turn that confirmed save into
+  // an error. Use only the workspace's recorded IDs and statuses; opening a
+  // draft still fetches and verifies its current content directly in eSputnik.
+  if(search===TAG&&start===1){
+   const {state}=await controlRead();const operations=state.operations.slice().reverse();
+   const saved=Object.values(state.records).map(record=>{
+    const receipt=operations.find(o=>o.status==='saved'&&o.data.messageId===record.id&&typeof o.data.name==='string');
+    return {id:record.id,name:typeof receipt?.data.name==='string'?receipt.data.name:`Лист eSputnik #${record.id}`,subject:'',template:record.kind==='template',updatedAt:record.updatedAt};
+   });
+   return {rows:saved,more:false,total:String(saved.length)};
+  }
+  if(data===null||data==='')return {rows:[],more:false,total:headers.get('TotalCount')};
+  throw new AppError('eSputnik не повернув список листів. Збережені чернетки можна відкрити у розділі «Кампанії».',502);
+ }
+ return {rows:rows.map((v:Record<string,unknown>)=>({id:messageId.parse(v.id),name:String(v.name||v.subject||`Лист ${v.id}`),subject:String(v.subject||''),template:v.template===true,updatedAt:typeof v.updatedDate==='string'?v.updatedDate:''})),more:rows.length===50,total:headers.get('TotalCount')};
+}
 export async function loadedCampaign(id:string){const r=await readMessage(messageId.parse(id));const c=await decodeMessage(r);const {state}=await controlRead();let record=state.records[id];if(!record)throw new AppError('Службовий статус цього листа відсутній. Перевірте його в eSputnik; для редагування використайте копію через розділ шаблонів.',409);
  if(record.fingerprint!==r.fingerprint&&record.status==='draft'){record=await controlChange(s=>{const value=s.records[id];if(value.status!=='draft')throw new AppError('Статус листа змінився. Оновіть сторінку.',409);if(value.fingerprint!==r.fingerprint){value.revision++;value.fingerprint=r.fingerprint;value.testedHash=null;delete value.test;value.updatedAt=new Date().toISOString();}return value;});}
  return {remote:r,data:c,record};}
