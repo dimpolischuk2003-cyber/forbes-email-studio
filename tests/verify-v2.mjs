@@ -4,6 +4,8 @@ import {rm} from 'node:fs/promises';
 import {join} from 'node:path';
 import {pathToFileURL} from 'node:url';
 import {randomUUID} from 'node:crypto';
+import {get as sdkBlobGet,BlobPreconditionFailedError,BlobAccessError} from '@vercel/blob';
+import {MockAgent,getGlobalDispatcher,setGlobalDispatcher} from 'undici';
 
 // Exercise real handlers/auth/provider adapter/control CAS with an isolated fake provider.
 // Separate handler bundles represent independent workers sharing the same Blob store.
@@ -20,30 +22,32 @@ process.env.ESPUTNIK_TIMEZONE='Europe/Kyiv';
 process.env.ESPUTNIK_TIMEZONE_CONFIRMED='true';
 const jar=new Map();
 globalThis.__studioCookies={get:name=>jar.has(name)?{value:jar.get(name)}:undefined,set:(name,value,options)=>{if(options?.maxAge===0)jar.delete(name);else jar.set(name,value);}};
-let blob=null,etag=0,blobDown=false;
+let blob=null,etag=0,blobDown=false,loseAcknowledgement=false,failFinalize=false,missingEtag=false;
+const probes=new Map();
 globalThis.__studioBlob={
- async get(_path,options){assert.equal(options.useCache,false);assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(blob===null)return null;const captured=blob;const capturedTag=String(etag);await Promise.resolve();return {statusCode:200,stream:new Response(captured).body,blob:{etag:capturedTag}};},
- async put(_path,body,options){assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(blob!==null&&(!options.allowOverwrite||options.ifMatch!==String(etag)))throw new Error('precondition failed');blob=body;etag++;return {};},
+ async get(path,options){assert.equal(options.useCache,false);assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(path.includes('/diagnostics/')){const item=probes.get(path);return item?{statusCode:200,stream:new Response(item.body).body,blob:{etag:item.etag}}:null;}if(blob===null)return null;const captured=blob;const capturedTag=missingEtag?'':String(etag);await Promise.resolve();return {statusCode:200,stream:new Response(captured).body,blob:{etag:capturedTag}};},
+ async put(path,body,options){assert.equal(options.access,'private');if(blobDown)throw new Error('offline');if(path.includes('/diagnostics/')){const previous=probes.get(path);if(previous&&(!options.allowOverwrite||options.ifMatch!==previous.etag))throw new BlobPreconditionFailedError();const tag=String((previous?.revision||0)+1);probes.set(path,{body,etag:tag,revision:Number(tag)});return {etag:tag};}if(blob!==null&&(!options.allowOverwrite||options.ifMatch!==String(etag)))throw new BlobPreconditionFailedError();if(failFinalize&&Object.keys(JSON.parse(body).records).length>Object.keys(JSON.parse(blob).records).length){failFinalize=false;throw new BlobAccessError();}blob=body;etag++;if(loseAcknowledgement){loseAcknowledgement=false;throw new Error('response lost after commit');}return {etag:String(etag)};},
+ async del(path){probes.delete(path);},
 };
-const plugins=[{name:'test-adapters',setup(b){b.onResolve({filter:/^(next\/headers|@vercel\/blob)$/},args=>({path:args.path,namespace:'studio-test'}));b.onLoad({filter:/.*/,namespace:'studio-test'},args=>({contents:args.path==='next/headers'?'export async function cookies(){return globalThis.__studioCookies;}':'export const get=(...a)=>globalThis.__studioBlob.get(...a);export const put=(...a)=>globalThis.__studioBlob.put(...a);',loader:'js'}));}}];
+const plugins=[{name:'test-adapters',setup(b){b.onResolve({filter:/^(next\/headers|@vercel\/blob)$/},args=>({path:args.path,namespace:'studio-test'}));b.onLoad({filter:/.*/,namespace:'studio-test'},args=>({contents:args.path==='next/headers'?'export async function cookies(){return globalThis.__studioCookies;}':'export const get=(...a)=>globalThis.__studioBlob.get(...a);export const put=(...a)=>globalThis.__studioBlob.put(...a);export const del=(...a)=>globalThis.__studioBlob.del(...a);',loader:'js'}));}}];
 let bundleId=0;
 // Project-local bundles resolve external packages through node_modules.
 const {mkdir}=await import('node:fs/promises');
 const localDir=join(process.cwd(),'.test-run');await mkdir(localDir,{recursive:true});
 async function route(name){const outfile=join(localDir,'handler-'+bundleId+++'.mjs');await build({entryPoints:['app/api/'+name+'/route.ts'],outfile,bundle:true,platform:'node',format:'esm',packages:'external',plugins,logLevel:'silent'});return import(pathToFileURL(outfile));}
-const [login,studio,studio2,test,test2,review,launch,launch2,templates,remote,audiences,statistics,settings]=await Promise.all(['auth/login','studio','studio','test','test','review','launch','launch','templates','remote-templates','audiences','statistics','settings'].map(route));
+const [login,studio,studio2,test,test2,review,launch,launch2,templates,remote,audiences,statistics,settings,segments,diagnostics,recover]=await Promise.all(['auth/login','studio','studio','test','test','review','launch','launch','templates','remote-templates','audiences','statistics','settings','segments','diagnostics','recover'].map(route));
 const domain='https://studio.example.com';
 async function call(handler,body,path='/api/action',origin=domain){const method=body===undefined?'GET':'POST';const request=new Request(domain+path,{method,headers:{origin,'content-type':'application/json','x-forwarded-for':'127.0.0.1'},body:body===undefined?undefined:JSON.stringify(body)});const r=await handler(request);return {status:r.status,data:await r.json()};}
 const messages=new Map(),broadcasts=new Map(),groupRows=[{id:7,name:'Readers',contactsCount:10}];
-let nextId=100,broadcastCalls=0,testCalls=0,importCalls=0,ambiguous=false,testAmbiguous=false;
+let nextId=100,broadcastCalls=0,testCalls=0,importCalls=0,ambiguous=false,testAmbiguous=false,denyGroups=false,listShape='array';
 globalThis.fetch=async function(url,options){assert.match(String(url),/^https:\/\/esputnik.com\/api\/v1\//);assert.equal(options.headers.Authorization,'Basic '+Buffer.from('forbes:test-provider-key').toString('base64'));const u=new URL(url),p=u.pathname.replace('/api/v1','');const body=options.body?JSON.parse(options.body):null;const response=(data,headers={})=>Response.json(data,{headers});
  if(p==='/messages/email'&&body){const id=String(nextId++);messages.set(id,{...body,id});return response({id:Number(id)});}
- if(p==='/messages/email'){const search=u.searchParams.get('search');return response([...messages.values()].filter(x=>!search||x.tags?.includes(search)||x.name.includes(search)).map(x=>({id:Number(x.id),name:x.name,subject:x.subject,template:x.template})),{TotalCount:String(messages.size)});}
+ if(p==='/messages/email'){const search=u.searchParams.get('search');if(listShape==='null')return response(null);if(listShape==='empty')return new Response(null,{status:204});if(listShape==='unexpected')return response({unexpected:'Private provider diagnostic'});if(listShape==='forbidden')return new Response('Forbidden',{status:403});const rows=[...messages.values()].filter(x=>!search||x.tags?.includes(search)||x.name.includes(search)).map(x=>({id:Number(x.id),name:x.name,subject:x.subject,template:x.template}));return response(listShape==='wrapped'?{messages:rows}:rows,{TotalCount:String(messages.size)});}
  if(p.startsWith('/messages/email/')){const id=p.split('/').at(-1);if(!messages.has(id))return new Response('missing',{status:404});if(options.method==='PUT'){messages.set(id,{...body,id});return response({id:Number(id)});}return response(messages.get(id));}
  if(p==='/message/email'){testCalls++;assert.equal(body.emails.length,1);assert.equal(body.emails[0],'marketer@example.com');assert.ok(!body.htmlText.includes('forbes-studio-v2:'));if(testAmbiguous)throw new Error('timeout after provider acceptance');return response({results:[{status:'OK'}]});}
  if(p==='/broadcast'&&body){broadcastCalls++;assert.ok(!messages.get(String(body.messageId)).htmlText.includes('forbes-studio-v2:'));const id=String(broadcastCalls);broadcasts.set(id,body);if(ambiguous)throw new Error('timeout after provider acceptance');return response({id});}
  if(p.startsWith('/broadcast/'))return response({status:'FINISHED',statistics:{sent:10,delivered:9,uniqueOpened:5,uniqueClicked:2,unsubscribed:1,errors:1}});
- if(p==='/groups')return response(groupRows);
+ if(p==='/groups')return denyGroups?new Response('Forbidden',{status:403}):response(groupRows);
  if(p.startsWith('/group/'))return response([],{TotalCount:String(groupRows.find(g=>g.id===Number(p.split('/')[2]))?.contactsCount||0)});
  if(p==='/contacts'){importCalls++;const count=body.contacts.length;assert.ok(count<=3000);const id=20+importCalls;groupRows.push({id,name:body.groupNames[0],contactsCount:count});return response({asyncSessionId:'session-'+importCalls,failedContacts:[]});}
  if(p.startsWith('/importstatus/'))return response({status:'COMPLETED'});
@@ -60,6 +64,42 @@ try{
  assert.equal((await call(studio.POST,{data:{...base,subject:'Different'},token})).status,409);
  const opened=await call(studio2.GET,undefined,'/api/studio?id='+id);assert.equal(opened.status,200);assert.equal(opened.data.data.blocks.length,2);assert.ok(!opened.data.data.blocks[1].html.includes('<script'));
  assert.ok(!blob.includes('Private draft body marker'));assert.ok(!blob.includes('<html'));assert.ok(!blob.includes(process.env.ESPUTNIK_API_KEY));assert.ok(!blob.includes(process.env.STUDIO_PASSWORD));
+ // A successful draft save remains visible when the subsequent search has no
+ // usable list. Direct reads still verify the actual stored letter.
+ const beforeCatalogRefresh=messages.size;
+ for(const shape of ['null','empty','unexpected']){
+  listShape=shape;const refreshed=await call(studio.GET,undefined);assert.equal(refreshed.status,200);
+  const saved=refreshed.data.campaigns.find(row=>row.id===id);assert.equal(saved.status,'draft');assert.equal(saved.name,base.name);
+  assert.ok(!JSON.stringify(refreshed.data).includes('Private provider diagnostic'));
+  assert.equal((await call(studio2.GET,undefined,'/api/studio?id='+id)).status,200);
+  assert.equal((await call(studio.POST,{data:base,token})).data.id,id);
+ }
+ assert.equal(messages.size,beforeCatalogRefresh);
+ for(const shape of ['null','empty']){listShape=shape;const empty=await call(remote.GET,undefined,'/api/remote-templates?search=absent');assert.equal(empty.status,200);assert.deepEqual(empty.data.templates,[]);assert.equal(empty.data.more,false);}
+ listShape='unexpected';assert.equal((await call(remote.GET,undefined)).status,502);
+ listShape='forbidden';assert.equal((await call(studio.GET,undefined)).status,502);
+ listShape='wrapped';const wrapped=await call(studio.GET,undefined);assert.equal(wrapped.status,200);assert.ok(wrapped.data.campaigns.some(row=>row.id===id));listShape='array';
+ // A Blob upload can commit and then lose its acknowledgement. It must not
+ // reapply the logical claim, fail the save, or create another provider letter.
+ loseAcknowledgement=true;const accepted=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(accepted.status,201);
+ // The provider may create a letter before final status persistence fails.
+ // It must remain readable and recover only its own unfinished CREATE.
+ failFinalize=true;const recoveryToken=randomUUID();const beforePartial=messages.size;
+ const partial=await call(studio.POST,{data:base,token:recoveryToken});assert.equal(partial.status,503);assert.match(partial.data.error,/BLOB_ACCESS_DENIED/);
+ assert.equal(messages.size,beforePartial+1);const orphanId=String(nextId-1);assert.equal(partial.data.draft.id,orphanId);
+ const orphan=await call(studio.GET,undefined,'/api/studio?id='+orphanId);assert.equal(orphan.status,200);assert.equal(orphan.data.status,'unknown');assert.equal(orphan.data.recoverable,true);
+ assert.equal((await call(review.POST,{id:orphanId})).status,409);
+ assert.equal((await call(studio.POST,{id:orphanId,revision:1,data:base})).status,409);
+ assert.equal((await call(recover.POST,{id:orphanId},'/api/recover','https://evil.example')).status,403);
+ const originalOrphan=structuredClone(messages.get(orphanId));messages.get(orphanId).htmlText=messages.get(orphanId).htmlText.replace('Hello','Tampered');
+ assert.equal((await call(recover.POST,{id:orphanId})).status,409);messages.set(orphanId,originalOrphan);
+ const beforeRecoveryBody=messages.get(orphanId).htmlText;
+ assert.equal((await call(recover.POST,{id:orphanId})).status,200);assert.equal(messages.size,beforePartial+1);assert.equal(messages.get(orphanId).htmlText,beforeRecoveryBody);
+ assert.equal((await call(studio.GET,undefined,'/api/studio?id='+orphanId)).data.status,'draft');
+ assert.equal((await call(recover.POST,{id:orphanId})).status,409);
+ assert.equal((await call(studio.POST,{data:base,token:recoveryToken})).data.id,orphanId);
+ missingEtag=true;const etagFailure=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(etagFailure.status,503);assert.match(etagFailure.data.error,/BLOB_ETAG_MISSING/);missingEtag=false;
+ const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.1');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
  const beforeTemplates=messages.size;const template=await call(templates.POST,{data:base,name:'Reusable',token:randomUUID()});assert.equal(template.status,201);assert.equal(messages.get(template.data.id).template,true);const original=structuredClone(messages.get(template.data.id));const chosen=await call(remote.POST,{id:template.data.id});assert.equal(chosen.status,200);assert.deepEqual(messages.get(template.data.id),original);assert.equal(messages.size,beforeTemplates+1);
  assert.equal((await call(review.POST,{id})).status,400);
  const tests=await Promise.all([call(test.POST,{id}),call(test2.POST,{id})]);assert.ok(tests.some(x=>x.status===200));assert.equal(testCalls,1);assert.equal((await call(test.POST,{id})).data.already,true);
@@ -74,7 +114,23 @@ try{
  process.env.ESPUTNIK_SEND_ENABLED='false';assert.equal((await call(review.POST,{id:blocked.data.id})).status,400);process.env.ESPUTNIK_SEND_ENABLED='true';
  blobDown=true;const countBefore=messages.size;assert.equal((await call(studio.POST,{data:base,token:randomUUID()})).status,503);assert.equal(messages.size,countBefore);blobDown=false;
  assert.equal((await call(settings.POST,{apiKey:'secret',config:{}})).status,400);assert.ok(!JSON.stringify((await call(studio.GET,undefined)).data).includes(process.env.ESPUTNIK_API_KEY));
+ // Connected OIDC stores work even when the token exists only in the request context.
+ delete process.env.BLOB_READ_WRITE_TOKEN;delete process.env.VERCEL_OIDC_TOKEN;process.env.BLOB_STORE_ID='store_regression';
+ const contextKey=Symbol.for('@vercel/request-context'),previousContext=globalThis[contextKey];
+ const oidcToken=['eyJhbGciOiJub25lIn0',Buffer.from(JSON.stringify({exp:Math.floor(Date.now()/1000)+3600})).toString('base64url'),'test'].join('.');
+ globalThis[contextKey]={get:()=>({headers:{'x-vercel-oidc-token':oidcToken}})};
+ const dispatcher=getGlobalDispatcher(),mockAgent=new MockAgent();mockAgent.disableNetConnect();
+ mockAgent.get('https://regression.private.blob.vercel-storage.com').intercept({path:'/regression.json?cache=0',method:'GET',headers:{authorization:'Bearer '+oidcToken}}).reply(404,'');
+ setGlobalDispatcher(mockAgent);
+ try{assert.equal(await sdkBlobGet('regression.json',{access:'private',useCache:false}),null);mockAgent.assertNoPendingInterceptors();}
+ finally{setGlobalDispatcher(dispatcher);await mockAgent.close();if(previousContext===undefined)delete globalThis[contextKey];else globalThis[contextKey]=previousContext;}
+ const oidcDraft=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(oidcDraft.status,201);
+ assert.equal((await call(studio.GET,undefined,'/api/studio?id='+oidcDraft.data.id)).status,200);
+ delete process.env.BLOB_STORE_ID;const beforeMissingStore=messages.size;
+ assert.equal((await call(studio.POST,{data:base,token:randomUUID()})).status,503);assert.equal(messages.size,beforeMissingStore);
+ process.env.BLOB_READ_WRITE_TOKEN='test-blob-token';
+ denyGroups=true;const denied=await call(segments.GET,undefined);assert.equal(denied.status,502);assert.match(denied.data.error,/баз отримувачів.*403/);assert.ok(!denied.data.error.includes(process.env.ESPUTNIK_API_KEY));denyGroups=false;
  process.env.ESPUTNIK_API_KEY='rotated-key';assert.equal((await call(studio.GET,undefined)).status,503);process.env.ESPUTNIK_API_KEY='test-provider-key';
  process.env.STUDIO_PASSWORD='rotated-password-long-enough';assert.equal((await call(studio.GET,undefined)).status,401);
- console.log('PASS: auth, CSRF, eSputnik draft persistence, templates, concurrent CAS claims, stale edits, test/review/launch, ambiguous outcomes, imports, schedules, stats, credential rotation, secret redaction.');
+ console.log('PASS: auth, CSRF, eSputnik draft persistence, post-save list refresh, committed-write acknowledgements, orphan draft recovery, diagnostics, missing ETags, empty/unsupported search responses, templates, concurrent CAS claims, stale edits, test/review/launch, ambiguous outcomes, imports, schedules, stats, Blob request-context OIDC, group access errors, credential rotation, secret redaction.');
 }finally{await rm(localDir,{recursive:true,force:true});}

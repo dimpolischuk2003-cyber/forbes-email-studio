@@ -1,0 +1,7 @@
+'use client';
+import {useState} from 'react';
+type Report={build:{version:string;commit:string;environment:string};host:string;ok:boolean;checks:{name:string;ok:boolean;detail:string}[]};
+export function ConnectionCheck(){
+ const [report,setReport]=useState<Report|null>(null),[busy,setBusy]=useState(false),[error,setError]=useState('');
+ return <section className="settings-card"><h2>Перевірка підключень</h2><p className="helper">Перевіряє доступ до листів, баз та службової історії. Для перевірки сховища створює й видаляє окремий тимчасовий запис.</p><button className="button secondary" disabled={busy} onClick={async()=>{setBusy(true);setError('');try{const r=await fetch('/api/diagnostics',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});const data=await r.json();if(!r.ok)throw new Error(data.error||'Перевірку не завершено.');setReport(data);}catch(e){setError(e instanceof Error?e.message:'Не вдалося перевірити підключення.');}finally{setBusy(false);}}}>{busy?'Перевіряємо…':'Перевірити підключення'}</button>{error&&<p className="local-error" role="alert">{error}</p>}{report&&<div role="status"><p className="helper">Версія {report.build.version} · {report.build.commit} · {report.build.environment}<br/>{report.host}</p>{report.checks.map(check=><div key={check.name} className="inline-note" style={{marginTop:12,display:'block'}}><strong>{check.ok?'✓':'!'} {check.name}</strong><p className="helper">{check.detail}</p></div>)}</div>}</section>;
+}
