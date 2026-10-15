@@ -8,9 +8,11 @@ import {MockAgent,getGlobalDispatcher,setGlobalDispatcher} from 'undici';
 // Real installed @vercel/blob, real OIDC resolver, real HTTP serialization,
 // and production control code. Only the remote HTTP endpoints are simulated.
 const directory=join(process.cwd(),'.test-storage-sdk');await mkdir(directory,{recursive:true});
-const outfile=join(directory,'control.mjs');
-await build({entryPoints:['lib/control.ts'],outfile,bundle:true,platform:'node',format:'esm',packages:'external',logLevel:'silent'});
-const {controlRead,controlChange,probeStorage}=await import(pathToFileURL(outfile));
+const minified=process.argv.includes('--minified');
+const outfile=join(directory,minified?'control.cjs':'control.mjs');
+await build({entryPoints:['lib/control.ts'],outfile,bundle:true,platform:'node',...(minified?{format:'cjs',minify:true}:{format:'esm',packages:'external'}),logLevel:'silent'});
+const loaded=await import(pathToFileURL(outfile));
+const {controlRead,controlChange,probeStorage}=minified?loaded.default:loaded;
 process.env.ESPUTNIK_API_KEY='sdk-test-provider-key';
 process.env.BLOB_STORE_ID='store_sdk';delete process.env.BLOB_READ_WRITE_TOKEN;delete process.env.VERCEL_OIDC_TOKEN;
 process.env.VERCEL_BLOB_API_URL='https://blob-api.test.invalid';process.env.VERCEL_BLOB_RETRIES='1';
@@ -55,5 +57,5 @@ try{
  assert.equal(apiPuts-beforeDenied,1);denyWrites=false;
  omitEtag=true;await assert.rejects(controlRead(),error=>error.code==='BLOB_ETAG_MISSING');omitEtag=false;
  const beforeProbe=[...files.entries()];assert.equal((await probeStorage()).ok,true);assert.deepEqual([...files.entries()],beforeProbe);
- console.log('PASS: real Blob SDK HTTP, request-context OIDC, quoted ETags, committed-write acknowledgement loss, conditional-write conflict, fatal access errors, missing ETag, isolated diagnostic probe and cleanup.');
+ console.log((minified?'MINIFIED BUNDLE ':'')+'PASS: real Blob SDK HTTP, request-context OIDC, quoted ETags, committed-write acknowledgement loss, conditional-write conflict, fatal access errors, missing ETag, isolated diagnostic probe and cleanup.');
 }finally{setGlobalDispatcher(originalDispatcher);await agent.close();delete globalThis[contextKey];await rm(directory,{recursive:true,force:true});}
