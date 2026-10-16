@@ -6,8 +6,8 @@ import {join} from 'node:path';
 const directory=join(process.cwd(),'.test-preheader');await mkdir(directory,{recursive:true});
 try{
  const outfile=join(directory,'helpers.mjs');
- await build({stdin:{contents:"export * from './lib/preheader';export * from './lib/email';export * from './lib/sanitize';",resolveDir:process.cwd(),loader:'ts'},outfile,bundle:true,platform:'node',format:'esm',packages:'external',logLevel:'silent'});
- const {withPreheader,preheaderHtml,readPreheader,renderEmail,canonicalCampaign,emptyCampaign}=await import(pathToFileURL(outfile));
+ await build({stdin:{contents:"export * from './lib/preheader';export * from './lib/email';export * from './lib/sanitize';export * from './lib/email-links';",resolveDir:process.cwd(),loader:'ts'},outfile,bundle:true,platform:'node',format:'esm',packages:'external',logLevel:'silent'});
+ const {withPreheader,preheaderHtml,readPreheader,renderEmail,canonicalCampaign,emptyCampaign,validateForSend,campaignLinks}=await import(pathToFileURL(outfile));
  const content='<table><tr><td><a href="https://example.com/button?x=1&amp;y=2">Button text</a><img src="https://example.com/image.png"></td></tr></table>';
  const letter='<!doctype html><html><head><style>.x{color:red}</style></head><body>'+content+'</body></html>';
  const value='Тест — журнал & події <сьогодні> "Forbes" 🗞️';
@@ -28,5 +28,13 @@ try{
   for(const preview of [false,true]){const html=renderEmail(c,undefined,preview);assert.equal(readPreheader(html),value);assert.equal(readPreheader(canonicalCampaign({...c,imported_html:html}).imported_html),value);assert.equal((html.match(/id="forbes-studio-preheader"/g)||[]).length,1);}
  }
  assert.equal(readPreheader('<div class="esd-hidden-preheader">Actual<script>ignored()</script> text</div>'),'Actual text');
+ const realFooter='<div style="background:black"><a href="mailto:support@forbes.ua">support@forbes.ua</a><a href="https://example.com/manage"><span>Керувати підписками</span></a><a href="https://esclick.me/system-token"><span>відписатися</span></a></div>';
+ const imported={...emptyCampaign,name:'Footer',subject:'Subject',blocks:[],imported_html:'<html><body><a href="https://example.com/cta">Action</a>'+realFooter+'</body></html>',preheader:'Header',utm_enabled:true,utm_source:'studio',utm_medium:'email',utm_campaign:'footer-test'};
+ const footerConfig={senderName:'Forbes',senderEmail:'news@example.com',address:'',unsubscribe:''};
+ assert.deepEqual(validateForSend(imported,footerConfig),[]);
+ const keptFooter=renderEmail(imported,footerConfig);assert.ok(keptFooter.includes(realFooter));assert.ok(keptFooter.includes('utm_campaign=footer-test'));assert.ok(!keptFooter.includes('href="#"'));assert.ok(!keptFooter.includes('data-studio-footer'));
+ const urls=campaignLinks(imported);assert.ok(urls.includes('https://example.com/manage'));assert.ok(urls.includes('https://esclick.me/system-token'));assert.ok(urls.some(url=>url.includes('/cta?utm_source=')));
+ const oldPlaceholder='<a href="#" style="color:#737780">Відписатися від розсилки</a>';assert.ok(!renderEmail({...imported,imported_html:'<body>'+oldPlaceholder+realFooter+'</body>'},footerConfig).includes(oldPlaceholder));
+ const nativeFooter=renderEmail({...emptyCampaign,name:'Native',subject:'Subject',headline:'Headline',body:'Body',button_text:''},{...footerConfig,unsubscribe:'https://example.com/personal-recipient-link'});assert.ok(!nativeFooter.includes('personal-recipient-link'));assert.ok(!nativeFooter.includes('Відписатися від розсилки'));
  console.log('PASS: preheader HTML on native/imported templates, provider class and legacy block, entity decoding, nested markup, replacement/clearing without duplicates, source preservation, malformed input, sanitization and preview/send consistency.');
 }finally{await rm(directory,{recursive:true,force:true});}
