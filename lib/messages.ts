@@ -2,6 +2,7 @@ import {z} from 'zod';
 import {esputnik,apiKey,hash,AppError,type Config} from './server';
 import {campaignSchema,emptyCampaign,renderEmail,type Campaign} from './email';
 import {canonicalCampaign} from './sanitize';
+import {readPreheader} from './preheader';
 import {sign,verify} from './tokens';
 import {controlRead,controlChange,log,type RecordState} from './control';
 import {DraftSaveError,DraftPendingError} from './errors';
@@ -12,7 +13,7 @@ type Remote={id:string;name:string;subject:string;from:string;html:string;source
 export async function readMessage(id:string):Promise<Remote>{messageId.parse(id);const {data}=await esputnik(await apiKey(),`/messages/email/${id}`);const v=data as Record<string,unknown>;const content=v?.content as Record<string,unknown>|undefined;const html=v?.htmlText||v?.html||v?.rawHtml||content?.html||content?.htmlText||(typeof v?.content==='string'?v.content:'');if(typeof html!=='string'||!html.trim())throw new AppError('У листі немає HTML для редагування.',502);const css=v.css||content?.css;const combined=typeof css==='string'&&css.trim()?`<style>${css}</style>${html}`:html;const r={id,name:String(v.name||`eSputnik ${id}`),subject:String(v.subject||''),from:String(v.from||''),html:combined,template:v.template===true};return {...r,sourceHtml:html,separateCss:typeof css==='string'&&!!css.trim(),tags:Array.isArray(v.tags)?v.tags.filter((x):x is string=>typeof x==='string'):[],fingerprint:await hash(r)};}
 export async function encodeMessage(c:Campaign,f:Config,template=false){const html=renderEmail(c,f);const meta=sign('editor',{data:c,htmlHash:await hash(html)});return {name:c.name||'Без назви',from:`"${f.senderName}" <${f.senderEmail}>`,subject:c.subject||'Без теми',htmlText:html+`<!--forbes-studio-v2:${meta}-->`,languageCode:'uk',tags:[TAG],subscriptionsKeys:f.subscriptionsKeys,template};}
 export async function decodeMessage(r:Remote){const tokens=Array.from(r.html.matchAll(marker));const html=r.html.replace(marker,'');if(tokens.length===1){const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);if(meta&&meta.htmlHash===await hash(html)){const parsed=campaignSchema.safeParse(meta.data);if(parsed.success&&r.name===(parsed.data.name||'Без назви')&&r.subject===(parsed.data.subject||'Без теми'))return canonicalCampaign(parsed.data);}}
- if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
+ if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),preheader:readPreheader(html),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
 /** eSputnik can return a single ID object for a one-result search. */
 function messageRows(data:unknown,depth=0):Record<string,unknown>[]|null{
  if(Array.isArray(data))return data.filter((row):row is Record<string,unknown>=>!!row&&typeof row==='object'&&!Array.isArray(row));
