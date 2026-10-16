@@ -8,8 +8,8 @@ import {DraftSaveError,DraftPendingError} from './errors';
 export const TAG='forbes-email-studio-v2';
 const marker=/<!--forbes-studio-v2:([A-Za-z0-9_.-]+)-->/g;
 export const messageId=z.coerce.string().regex(/^\d{1,16}$/);
-type Remote={id:string;name:string;subject:string;from:string;html:string;template:boolean;tags:string[];fingerprint:string};
-export async function readMessage(id:string):Promise<Remote>{messageId.parse(id);const {data}=await esputnik(await apiKey(),`/messages/email/${id}`);const v=data as Record<string,unknown>;const content=v?.content as Record<string,unknown>|undefined;const html=v?.htmlText||v?.html||v?.rawHtml||content?.html||content?.htmlText||(typeof v?.content==='string'?v.content:'');if(typeof html!=='string'||!html.trim())throw new AppError('У листі немає HTML для редагування.',502);const css=v.css||content?.css;const combined=typeof css==='string'&&css.trim()?`<style>${css}</style>${html}`:html;const r={id,name:String(v.name||`eSputnik ${id}`),subject:String(v.subject||''),from:String(v.from||''),html:combined,template:v.template===true};return {...r,tags:Array.isArray(v.tags)?v.tags.filter((x):x is string=>typeof x==='string'):[],fingerprint:await hash(r)};}
+type Remote={id:string;name:string;subject:string;from:string;html:string;sourceHtml:string;separateCss:boolean;template:boolean;tags:string[];fingerprint:string};
+export async function readMessage(id:string):Promise<Remote>{messageId.parse(id);const {data}=await esputnik(await apiKey(),`/messages/email/${id}`);const v=data as Record<string,unknown>;const content=v?.content as Record<string,unknown>|undefined;const html=v?.htmlText||v?.html||v?.rawHtml||content?.html||content?.htmlText||(typeof v?.content==='string'?v.content:'');if(typeof html!=='string'||!html.trim())throw new AppError('У листі немає HTML для редагування.',502);const css=v.css||content?.css;const combined=typeof css==='string'&&css.trim()?`<style>${css}</style>${html}`:html;const r={id,name:String(v.name||`eSputnik ${id}`),subject:String(v.subject||''),from:String(v.from||''),html:combined,template:v.template===true};return {...r,sourceHtml:html,separateCss:typeof css==='string'&&!!css.trim(),tags:Array.isArray(v.tags)?v.tags.filter((x):x is string=>typeof x==='string'):[],fingerprint:await hash(r)};}
 export async function encodeMessage(c:Campaign,f:Config,template=false){const html=renderEmail(c,f);const meta=sign('editor',{data:c,htmlHash:await hash(html)});return {name:c.name||'Без назви',from:`"${f.senderName}" <${f.senderEmail}>`,subject:c.subject||'Без теми',htmlText:html+`<!--forbes-studio-v2:${meta}-->`,languageCode:'uk',tags:[TAG],subscriptionsKeys:f.subscriptionsKeys,template};}
 export async function decodeMessage(r:Remote){const tokens=Array.from(r.html.matchAll(marker));const html=r.html.replace(marker,'');if(tokens.length===1){const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);if(meta&&meta.htmlHash===await hash(html)){const parsed=campaignSchema.safeParse(meta.data);if(parsed.success&&r.name===(parsed.data.name||'Без назви')&&r.subject===(parsed.data.subject||'Без теми'))return canonicalCampaign(parsed.data);}}
  if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
@@ -49,6 +49,39 @@ async function recoveryContext(r:Remote,f:Config){
  if(!meta||meta.htmlHash!==await hash(r.html.replace(marker,'')))return null;
  const parsed=campaignSchema.safeParse(meta.data);if(!parsed.success||r.name!==(parsed.data.name||'Без назви')||r.subject!==(parsed.data.subject||'Без теми'))return null;
  const data=canonicalCampaign(parsed.data);return {key,data,hash:await hash({c:data,f,template:r.template})};
+}
+/** Read-only evidence for failed recovery. Never returns HTML, tokens or settings. */
+export async function diagnoseDraft(id:string,f:Config){
+ const r=await readMessage(messageId.parse(id));const {state}=await controlRead();
+ const tokens=Array.from(r.html.matchAll(marker));const key=creationKey(r);
+ const meta=tokens.length===1?verify<{data:unknown;htmlHash:unknown}>('editor',tokens[0][1]):null;
+ const parsed=meta?campaignSchema.safeParse(meta.data):null;
+ const validData=parsed?.success?canonicalCampaign(parsed.data):null;
+ const pending=key?state.creates[key]:undefined;const record=state.records[id];
+ const checks={
+  studioTag:r.tags.includes(TAG),sentCopyTag:r.tags.includes('forbes-email-studio-sent-v2'),uniqueCreationTag:!!key,
+  markerCount:tokens.length,signatureValid:!!meta,metadataValid:parsed?.success??false,
+  combinedHtmlMatches:meta?meta.htmlHash===await hash(r.html.replace(marker,'')):null,
+  sourceHtmlMatches:meta?meta.htmlHash===await hash(r.sourceHtml.replace(marker,'')):null,
+  separateCss:r.separateCss,
+  nameMatches:parsed?.success?r.name===(parsed.data.name||'Без назви'):null,
+  subjectMatches:parsed?.success?r.subject===(parsed.data.subject||'Без теми'):null,
+  recordExists:!!record,pendingExists:!!pending,
+  pendingStatus:pending?.status??null,
+  pendingIdMatches:pending?!pending.id||pending.id===id:null,
+  pendingRequestMatches:pending&&validData?pending.hash===await hash({c:validData,f,template:r.template}):null,
+ };
+ const reason=record?'RECORD_EXISTS':!key?'CREATION_TAG_INVALID':tokens.length===0?'EDITOR_MARKER_MISSING':tokens.length!==1?'EDITOR_MARKER_MULTIPLE':!meta?'EDITOR_SIGNATURE_INVALID':!checks.combinedHtmlMatches?'HTML_CHANGED':!checks.metadataValid?'EDITOR_METADATA_INVALID':!checks.nameMatches?'NAME_CHANGED':!checks.subjectMatches?'SUBJECT_CHANGED':!pending?'PENDING_CREATE_MISSING':!['creating','unknown'].includes(pending.status)?'PENDING_CREATE_NOT_RECOVERABLE':!checks.pendingIdMatches?'PENDING_ID_MISMATCH':!checks.pendingRequestMatches?'REQUEST_OR_SETTINGS_CHANGED':'READY';
+ let search:Record<string,unknown>={attempted:false};
+ if(key){try{
+  const token=key.slice(key.indexOf(':')+1);
+  const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=1&maxrows=50&search=${encodeURIComponent('studio-'+token)}`);
+  const rows=messageRows(data);const object=data&&typeof data==='object'&&!Array.isArray(data)?data as Record<string,unknown>:null;
+  const fields=['messages','emails','items','data','content','results','result','response','id','status','code','error','message'];
+  const shape=(v:unknown)=>v===null?'null':Array.isArray(v)?'array':typeof v;
+  search={attempted:true,responseType:shape(data),supportedList:rows!==null,rowCount:rows?.length??null,includesDraftId:rows?rows.some(row=>String(row.id)===id):null,knownFieldTypes:object?Object.fromEntries(fields.filter(field=>Object.hasOwn(object,field)).map(field=>[field,shape(object[field])])):{},totalCount:/^\d+$/.test(headers.get('TotalCount')||'')?Number(headers.get('TotalCount')):null};
+ }catch(e){search={attempted:true,failed:true,status:e instanceof AppError?e.status:502};}}
+ return {messageId:id,reason,checks,search};
 }
 export async function recoverDraft(id:string,f:Config,actor:string){
  const remote=await readMessage(messageId.parse(id));const recovery=await recoveryContext(remote,f);

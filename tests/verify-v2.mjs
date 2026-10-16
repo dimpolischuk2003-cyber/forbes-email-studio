@@ -37,6 +37,7 @@ const {mkdir}=await import('node:fs/promises');
 const localDir=join(process.cwd(),'.test-run');await mkdir(localDir,{recursive:true});
 async function route(name){const outfile=join(localDir,'handler-'+bundleId+++'.mjs');await build({entryPoints:['app/api/'+name+'/route.ts'],outfile,bundle:true,platform:'node',format:'esm',packages:'external',plugins,logLevel:'silent'});return import(pathToFileURL(outfile));}
 const [login,studio,studio2,test,test2,review,launch,launch2,templates,remote,audiences,statistics,settings,segments,diagnostics,recover]=await Promise.all(['auth/login','studio','studio','test','test','review','launch','launch','templates','remote-templates','audiences','statistics','settings','segments','diagnostics','recover'].map(route));
+const draftDiagnostics=await route('draft-diagnostics');
 const domain='https://studio.example.com';
 async function call(handler,body,path='/api/action',origin=domain){const method=body===undefined?'GET':'POST';const request=new Request(domain+path,{method,headers:{origin,'content-type':'application/json','x-forwarded-for':'127.0.0.1'},body:body===undefined?undefined:JSON.stringify(body)});const r=await handler(request);return {status:r.status,data:await r.json()};}
 const messages=new Map(),broadcasts=new Map(),groupRows=[{id:7,name:'Readers',contactsCount:10}];
@@ -56,6 +57,7 @@ globalThis.fetch=async function(url,options){assert.match(String(url),/^https:\/
 };
 try{
  assert.equal((await call(studio.GET,undefined)).status,401);
+ assert.equal((await call(draftDiagnostics.GET,undefined,'/api/draft-diagnostics?id=100')).status,401);
  assert.equal((await call(login.POST,{email:process.env.STUDIO_EMAIL,password:'wrong'})).status,401);
  assert.equal((await call(login.POST,{email:process.env.STUDIO_EMAIL,password:process.env.STUDIO_PASSWORD})).status,200);
  assert.ok(jar.has('forbes-studio-session'));
@@ -112,13 +114,26 @@ try{
  assert.equal((await call(recover.POST,{id:orphanId},'/api/recover','https://evil.example')).status,403);
  const originalOrphan=structuredClone(messages.get(orphanId));messages.get(orphanId).htmlText=messages.get(orphanId).htmlText.replace('Hello','Tampered');
  assert.equal((await call(recover.POST,{id:orphanId})).status,409);messages.set(orphanId,originalOrphan);
+ messages.set(orphanId,structuredClone(originalOrphan));
+ // Recovery diagnostics explain each proof failure without changing any state.
+ const diagnosticState=blob,diagnosticLetters=messages.size;
+ const report=async()=>{const result=await call(draftDiagnostics.GET,undefined,'/api/draft-diagnostics?id='+orphanId);assert.equal(result.status,200);assert.equal(result.data.readOnly,true);assert.equal(blob,diagnosticState);assert.equal(messages.size,diagnosticLetters);const output=JSON.stringify(result.data);for(const secret of [process.env.ESPUTNIK_API_KEY,process.env.STUDIO_SESSION_SECRET,process.env.EMAIL_SENDER_EMAIL,'Private draft body marker','<html','forbes-studio-v2:','Private provider diagnostic'])assert.ok(!output.includes(secret));return result.data;};
+ assert.equal((await report()).reason,'READY');
+ messages.get(orphanId).css='body{color:red}';const cssReport=await report();assert.equal(cssReport.reason,'HTML_CHANGED');assert.equal(cssReport.checks.sourceHtmlMatches,true);assert.equal(cssReport.checks.combinedHtmlMatches,false);delete messages.get(orphanId).css;
+ messages.get(orphanId).htmlText=originalOrphan.htmlText.replace('Hello','Changed');assert.equal((await report()).reason,'HTML_CHANGED');
+ messages.get(orphanId).htmlText=originalOrphan.htmlText.replace(/<!--forbes-studio-v2:[\s\S]*?-->/g,'');assert.equal((await report()).reason,'EDITOR_MARKER_MISSING');
+ messages.get(orphanId).htmlText=originalOrphan.htmlText.replace(/(<!--forbes-studio-v2:)[A-Za-z0-9_-]/,'$1!');assert.equal((await report()).reason,'EDITOR_MARKER_MISSING');
+ messages.get(orphanId).htmlText=originalOrphan.htmlText.replace(/(<!--forbes-studio-v2:)[A-Za-z0-9_-]/,(_,prefix)=>prefix+(originalOrphan.htmlText.match(/<!--forbes-studio-v2:([A-Za-z0-9_-])/)[1]==='a'?'b':'a'));assert.equal((await report()).reason,'EDITOR_SIGNATURE_INVALID');
+ messages.set(orphanId,structuredClone(originalOrphan));messages.get(orphanId).name='Changed name';assert.equal((await report()).reason,'NAME_CHANGED');messages.set(orphanId,structuredClone(originalOrphan));
+ process.env.EMAIL_FOOTER_ADDRESS='Changed address';assert.equal((await report()).reason,'REQUEST_OR_SETTINGS_CHANGED');process.env.EMAIL_FOOTER_ADDRESS='Forbes, Kyiv';
+ listShape='unexpected';const unsupportedReport=await report();assert.equal(unsupportedReport.search.supportedList,false);listShape='wrapped';assert.equal((await report()).search.includesDraftId,true);listShape='array';
  const beforeRecoveryBody=messages.get(orphanId).htmlText;
  assert.equal((await call(recover.POST,{id:orphanId})).status,200);assert.equal(messages.size,beforePartial+1);assert.equal(messages.get(orphanId).htmlText,beforeRecoveryBody);
  assert.equal((await call(studio.GET,undefined,'/api/studio?id='+orphanId)).data.status,'draft');
  assert.equal((await call(recover.POST,{id:orphanId})).status,409);
  assert.equal((await call(studio.POST,{data:base,token:recoveryToken})).data.id,orphanId);
  missingEtag=true;const etagFailure=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(etagFailure.status,503);assert.match(etagFailure.data.error,/BLOB_ETAG_MISSING/);missingEtag=false;
- const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.4');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
+ const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.5');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
  const beforeTemplates=messages.size;const template=await call(templates.POST,{data:base,name:'Reusable',token:randomUUID()});assert.equal(template.status,201);assert.equal(messages.get(template.data.id).template,true);const original=structuredClone(messages.get(template.data.id));const chosen=await call(remote.POST,{id:template.data.id});assert.equal(chosen.status,200);assert.deepEqual(messages.get(template.data.id),original);assert.equal(messages.size,beforeTemplates+1);
  assert.equal((await call(review.POST,{id})).status,400);
  const tests=await Promise.all([call(test.POST,{id}),call(test2.POST,{id})]);assert.ok(tests.some(x=>x.status===200));assert.equal(testCalls,1);assert.equal((await call(test.POST,{id})).data.already,true);
@@ -151,5 +166,6 @@ try{
  denyGroups=true;const denied=await call(segments.GET,undefined);assert.equal(denied.status,502);assert.match(denied.data.error,/баз отримувачів.*403/);assert.ok(!denied.data.error.includes(process.env.ESPUTNIK_API_KEY));denyGroups=false;
  process.env.ESPUTNIK_API_KEY='rotated-key';assert.equal((await call(studio.GET,undefined)).status,503);process.env.ESPUTNIK_API_KEY='test-provider-key';
  process.env.STUDIO_PASSWORD='rotated-password-long-enough';assert.equal((await call(studio.GET,undefined)).status,401);
+ assert.equal((await call(draftDiagnostics.GET,undefined,'/api/draft-diagnostics?id=100')).status,401);
  console.log('PASS: auth, CSRF, eSputnik draft persistence, post-save list refresh, committed-write acknowledgements, orphan draft recovery, diagnostics, missing ETags, empty/unsupported search responses, templates, concurrent CAS claims, stale edits, test/review/launch, ambiguous outcomes, imports, schedules, stats, Blob request-context OIDC, group access errors, credential rotation, secret redaction.');
 }finally{await rm(localDir,{recursive:true,force:true});}
