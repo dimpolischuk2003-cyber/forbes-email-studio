@@ -4,11 +4,11 @@ const {createHash}=require('node:crypto');
 const {MockAgent,setGlobalDispatcher}=require('undici');
 const token=process.env.VERCEL_OIDC_TOKEN;
 const agent=new MockAgent();agent.disableNetConnect();agent.enableNetConnect(/^(localhost|127\.0\.0\.1):/);setGlobalDispatcher(agent);
-const messages=new Map();let nextMessage=100;
+const messages=new Map();let nextMessage=100,loseDraftAck=process.env.STUDIO_TEST_LOSE_DRAFT_ACK==='1';
 agent.get('https://esputnik.com').intercept({path:/^\/api\/v1\/(messages\/email|groups)/,method:'GET'}).reply(options=>{
- const id=/\/messages\/email\/(\d+)/.exec(options.path)?.[1];return id?(messages.has(id)?response(200,messages.get(id)):response(404,{})):response(200,[]);
+ const id=/\/messages\/email\/(\d+)/.exec(options.path)?.[1];if(id)return messages.has(id)?response(200,messages.get(id)):response(404,{});if(options.path.includes('/messages/email')){const search=new URL(options.path,'https://esputnik.com').searchParams.get('search');return response(200,[...messages.values()].filter(item=>!search||item.tags?.includes(search)));}return response(200,[]);
 }).persist();
-agent.get('https://esputnik.com').intercept({path:'/api/v1/messages/email',method:'POST'}).reply(options=>{const id=String(nextMessage++);messages.set(id,{...JSON.parse(String(options.body)),id});return response(200,{id:Number(id)});}).persist();
+agent.get('https://esputnik.com').intercept({path:'/api/v1/messages/email',method:'POST'}).reply(options=>{const id=String(nextMessage++);messages.set(id,{...JSON.parse(String(options.body)),id});if(loseDraftAck){loseDraftAck=false;return response(503,{});}return response(200,{id:Number(id)});}).persist();
 agent.get('https://esputnik.com').intercept({path:/^\/api\/v1\/messages\/email\/\d+$/,method:'PUT'}).reply(options=>{const id=options.path.split('/').at(-1);if(!messages.has(id))return response(404,{});messages.set(id,{...JSON.parse(String(options.body)),id});return response(200,{id:Number(id)});}).persist();
 // Next configures its proxy dispatcher at startup. Restore the isolated mock
 // at each local HTTP request, before the real route calls the SDK.

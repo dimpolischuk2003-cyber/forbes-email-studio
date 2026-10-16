@@ -4,7 +4,7 @@ import {campaignSchema,emptyCampaign,renderEmail,type Campaign} from './email';
 import {canonicalCampaign} from './sanitize';
 import {sign,verify} from './tokens';
 import {controlRead,controlChange,log,type RecordState} from './control';
-import {DraftSaveError} from './errors';
+import {DraftSaveError,DraftPendingError} from './errors';
 export const TAG='forbes-email-studio-v2';
 const marker=/<!--forbes-studio-v2:([A-Za-z0-9_.-]+)-->/g;
 export const messageId=z.coerce.string().regex(/^\d{1,16}$/);
@@ -13,9 +13,16 @@ export async function readMessage(id:string):Promise<Remote>{messageId.parse(id)
 export async function encodeMessage(c:Campaign,f:Config,template=false){const html=renderEmail(c,f);const meta=sign('editor',{data:c,htmlHash:await hash(html)});return {name:c.name||'Без назви',from:`"${f.senderName}" <${f.senderEmail}>`,subject:c.subject||'Без теми',htmlText:html+`<!--forbes-studio-v2:${meta}-->`,languageCode:'uk',tags:[TAG],subscriptionsKeys:f.subscriptionsKeys,template};}
 export async function decodeMessage(r:Remote){const tokens=Array.from(r.html.matchAll(marker));const html=r.html.replace(marker,'');if(tokens.length===1){const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);if(meta&&meta.htmlHash===await hash(html)){const parsed=campaignSchema.safeParse(meta.data);if(parsed.success&&r.name===(parsed.data.name||'Без назви')&&r.subject===(parsed.data.subject||'Без теми'))return canonicalCampaign(parsed.data);}}
  if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
+/** Only explicit list envelopes are supported; recovery still verifies each letter. */
+function messageRows(data:unknown,depth=0):Record<string,unknown>[]|null{
+ if(Array.isArray(data))return data.filter((row):row is Record<string,unknown>=>!!row&&typeof row==='object'&&!Array.isArray(row));
+ if(!data||typeof data!=='object'||depth>2)return null;
+ for(const key of ['messages','emails','items','data','content','results']){const rows=messageRows((data as Record<string,unknown>)[key],depth+1);if(rows)return rows;}
+ return null;
+}
 export async function listedMessages(search=TAG,start=1){
  const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=${start}&maxrows=50&search=${encodeURIComponent(search)}`);
- const rows=Array.isArray(data)?data:(data as {messages?:unknown[]}|null)?.messages;
+ const rows=messageRows(data);
  if(!Array.isArray(rows)){
   // A draft has already been read back and recorded before the editor refreshes
   // this search. A missing search result must not turn that confirmed save into
@@ -62,7 +69,40 @@ export async function loadedCampaign(id:string){const r=await readMessage(messag
  if(record.fingerprint!==r.fingerprint&&record.status==='draft'){record=await controlChange(s=>{const value=s.records[id];if(value.status!=='draft')throw new AppError('Статус листа змінився. Оновіть сторінку.',409);if(value.fingerprint!==r.fingerprint){value.revision++;value.fingerprint=r.fingerprint;value.testedHash=null;delete value.test;value.updatedAt=new Date().toISOString();}return value;});}
  return {remote:r,data:c,record,recoverable:false};}
 export function recordRow(record:RecordState,data:Campaign){return {id:record.id,name:data.name,data,revision:record.revision,status:record.status,message_id:record.id,broadcast_id:record.broadcastId,updated_at:record.updatedAt};}
-export async function createMessage(c:Campaign,f:Config,token:string,actor:string,template=false){z.string().uuid().parse(token);const key=(template?'template:':'draft:')+token;const op=crypto.randomUUID();let createdId:string|undefined;const requestHash=await hash({c,f,template});const existing=(await controlRead()).state.creates[key];if(existing){if(existing.status==='saved'&&existing.id&&existing.hash===requestHash)return {id:existing.id,revision:1};throw new AppError('Створення цього листа вже розпочалося. Перевірте історію та eSputnik.',409);}
- try{await controlChange(s=>{if(s.creates[key])throw new AppError('Створення вже виконується.',409);s.creates[key]={status:'creating',operation:op,hash:requestHash};});
- const body=await encodeMessage(c,f,template);const {data}=await esputnik(await apiKey(),'/messages/email',{...body,tags:[TAG,`studio-${token}`]});const {providerId}=await import('./server');const id=messageId.parse(providerId(data));createdId=id;const r=await readMessage(id);await controlChange(s=>{s.creates[key]={status:'saved',id,operation:op,hash:requestHash};s.records[id]={id,kind:template?'template':'campaign',revision:1,fingerprint:r.fingerprint,status:'draft',testedHash:null,broadcastId:null,updatedAt:new Date().toISOString()};log(s,template?'template_saved':'created','saved',{actor,name:c.name,messageId:id},op);});return {id,revision:1};}
- catch(e){await controlChange(s=>{if(s.creates[key]?.operation===op&&s.creates[key].status!=='saved'){s.creates[key].status='unknown';if(createdId)s.creates[key].id=createdId;}}).catch(()=>{});if(createdId)throw new DraftSaveError(`Лист eSputnik #${createdId} створено, але службовий статус не підтверджено. Відкрийте його у «Кампаніях». ${e instanceof AppError?e.message:''}`,createdId,e instanceof AppError?e.status:503);throw e;}}
+/** Reconcile an uncertain CREATE using provider reads only. Never repeats POST. */
+export async function findCreatedDraft(token:string,template:boolean,f:Config,actor:string){
+ z.string().uuid().parse(token);const key=(template?'template:':'draft:')+token;
+ const pending=(await controlRead()).state.creates[key];
+ if(!pending)throw new AppError('Незавершену операцію не знайдено. Оновіть кампанії.',404);
+ if(pending.status==='saved'&&pending.id)return {id:pending.id,revision:(await controlRead()).state.records[pending.id]?.revision||1};
+ if(!['creating','unknown'].includes(pending.status))throw new AppError('Операція не підлягає перевірці.',409);
+ let ids:string[]=[];
+ if(pending.id)ids=[messageId.parse(pending.id)];
+ else{
+  const {data}=await esputnik(await apiKey(),`/messages/email?startindex=1&maxrows=50&search=${encodeURIComponent('studio-'+token)}`);
+  const rows=messageRows(data);
+  if(!rows)throw new AppError('eSputnik не повернув список для перевірки. Збереження залишається непідтвердженим; новий лист не створювався.',502);
+  ids=[...new Set(rows.map(row=>messageId.safeParse(row.id)).filter(result=>result.success).map(result=>result.data!))];
+  if(ids.length>10)throw new AppError('Пошук eSputnik повернув забагато листів. Потрібна перевірка у кабінеті; повторне створення заблоковане.',409);
+ }
+ const matches:string[]=[];
+ for(const id of ids){const remote=await readMessage(id);const context=await recoveryContext(remote,f);if(context?.key===key&&context.hash===pending.hash)matches.push(id);}
+ if(matches.length!==1)throw new AppError(matches.length?'Знайдено кілька відповідних листів. Автоматичне відновлення заблоковане.':'eSputnik поки не підтвердив створення цього листа. Можна перевірити пізніше або переглянути кабінет eSputnik. Повторне створення не запускалося.',409);
+ return recoverDraft(matches[0],f,actor);
+}
+export async function createMessage(c:Campaign,f:Config,token:string,actor:string,template=false){
+ z.string().uuid().parse(token);const key=(template?'template:':'draft:')+token;const op=crypto.randomUUID();let createdId:string|undefined,claimed=false,stage='створення листа';
+ const requestHash=await hash({c,f,template});const existing=(await controlRead()).state.creates[key];
+ if(existing){if(existing.status==='saved'&&existing.id&&existing.hash===requestHash)return {id:existing.id,revision:1};throw new DraftPendingError('Попереднє збереження потребує перевірки. Скористайтеся «Перевірити збереження» у кампаніях.',token,template);}
+ try{
+  await controlChange(s=>{if(s.creates[key])throw new DraftPendingError('Створення вже виконується. Перевірте збереження у кампаніях.',token,template);s.creates[key]={status:'creating',operation:op,hash:requestHash,name:c.name,actor,createdAt:new Date().toISOString()};log(s,'draft_create','creating',{actor,name:c.name,token,template},op);});claimed=true;
+  const body=await encodeMessage(c,f,template);const {data}=await esputnik(await apiKey(),'/messages/email',{...body,tags:[TAG,`studio-${token}`]});const {providerId}=await import('./server');const id=messageId.parse(providerId(data));createdId=id;
+  stage='читання створеного листа';const r=await readMessage(id);stage='збереження службового статусу';
+  await controlChange(s=>{s.creates[key]={...s.creates[key],status:'saved',id,operation:op,hash:requestHash};s.records[id]={id,kind:template?'template':'campaign',revision:1,fingerprint:r.fingerprint,status:'draft',testedHash:null,broadcastId:null,updatedAt:new Date().toISOString()};const receipt=s.operations.find(row=>row.id===op);if(receipt){receipt.kind=template?'template_saved':'created';receipt.status='saved';receipt.data={actor,name:c.name,messageId:id};}});return {id,revision:1};
+ }catch(e){
+  if(claimed)await controlChange(s=>{if(s.creates[key]?.operation===op&&s.creates[key].status!=='saved'){s.creates[key].status='unknown';if(createdId)s.creates[key].id=createdId;const receipt=s.operations.find(row=>row.id===op);if(receipt){receipt.status='unknown';receipt.data={...receipt.data,stage,...(createdId?{messageId:createdId}:{})};}}}).catch(()=>{});
+  if(createdId)throw new DraftSaveError(`Лист eSputnik #${createdId} створено, але статус не підтверджено. Етап: ${stage}. Відкрийте його у «Кампаніях». ${e instanceof AppError?e.message:''}`,createdId,e instanceof AppError?e.status:503);
+  if(claimed)throw new DraftPendingError(`Не отримано підтвердження збереження від eSputnik. Етап: ${stage}. Скористайтеся «Перевірити збереження» у кампаніях. ${e instanceof AppError?e.message:''} [DRAFT_CREATE_UNCONFIRMED]`,token,template,e instanceof AppError?e.status:502);
+  throw e;
+ }
+}

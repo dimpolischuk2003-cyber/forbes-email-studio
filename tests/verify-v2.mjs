@@ -40,11 +40,11 @@ const [login,studio,studio2,test,test2,review,launch,launch2,templates,remote,au
 const domain='https://studio.example.com';
 async function call(handler,body,path='/api/action',origin=domain){const method=body===undefined?'GET':'POST';const request=new Request(domain+path,{method,headers:{origin,'content-type':'application/json','x-forwarded-for':'127.0.0.1'},body:body===undefined?undefined:JSON.stringify(body)});const r=await handler(request);return {status:r.status,data:await r.json()};}
 const messages=new Map(),broadcasts=new Map(),groupRows=[{id:7,name:'Readers',contactsCount:10}];
-let nextId=100,broadcastCalls=0,testCalls=0,importCalls=0,ambiguous=false,testAmbiguous=false,denyGroups=false,listShape='array';
+let nextId=100,broadcastCalls=0,testCalls=0,importCalls=0,ambiguous=false,testAmbiguous=false,denyGroups=false,listShape='array',createTimeout=false;
 globalThis.fetch=async function(url,options){assert.match(String(url),/^https:\/\/esputnik.com\/api\/v1\//);assert.equal(options.headers.Authorization,'Basic '+Buffer.from('forbes:test-provider-key').toString('base64'));const u=new URL(url),p=u.pathname.replace('/api/v1','');const body=options.body?JSON.parse(options.body):null;const response=(data,headers={})=>Response.json(data,{headers});
- if(p==='/messages/email'&&body){const id=String(nextId++);messages.set(id,{...body,id});return response({id:Number(id)});}
+ if(p==='/messages/email'&&body){const id=String(nextId++);messages.set(id,{...body,id});if(createTimeout)throw new Error('timeout after draft creation');return response({id:Number(id)});}
  if(p==='/messages/email'){const search=u.searchParams.get('search');if(listShape==='null')return response(null);if(listShape==='empty')return new Response(null,{status:204});if(listShape==='unexpected')return response({unexpected:'Private provider diagnostic'});if(listShape==='forbidden')return new Response('Forbidden',{status:403});const rows=[...messages.values()].filter(x=>!search||x.tags?.includes(search)||x.name.includes(search)).map(x=>({id:Number(x.id),name:x.name,subject:x.subject,template:x.template}));return response(listShape==='wrapped'?{messages:rows}:rows,{TotalCount:String(messages.size)});}
- if(p.startsWith('/messages/email/')){const id=p.split('/').at(-1);if(!messages.has(id))return new Response('missing',{status:404});if(options.method==='PUT'){messages.set(id,{...body,id});return response({id:Number(id)});}return response(messages.get(id));}
+ if(p.startsWith('/messages/email/')){const id=p.split('/').at(-1);if(!messages.has(id))return new Response('missing',{status:404});if(options.method==='PUT'){messages.set(id,{...body,id});if(createTimeout)throw new Error('timeout after draft creation');return response({id:Number(id)});}return response(messages.get(id));}
  if(p==='/message/email'){testCalls++;assert.equal(body.emails.length,1);assert.equal(body.emails[0],'marketer@example.com');assert.ok(!body.htmlText.includes('forbes-studio-v2:'));if(testAmbiguous)throw new Error('timeout after provider acceptance');return response({results:[{status:'OK'}]});}
  if(p==='/broadcast'&&body){broadcastCalls++;assert.ok(!messages.get(String(body.messageId)).htmlText.includes('forbes-studio-v2:'));const id=String(broadcastCalls);broadcasts.set(id,body);if(ambiguous)throw new Error('timeout after provider acceptance');return response({id});}
  if(p.startsWith('/broadcast/'))return response({status:'FINISHED',statistics:{sent:10,delivered:9,uniqueOpened:5,uniqueClicked:2,unsubscribed:1,errors:1}});
@@ -83,6 +83,24 @@ try{
  // A Blob upload can commit and then lose its acknowledgement. It must not
  // reapply the logical claim, fail the save, or create another provider letter.
  loseAcknowledgement=true;const accepted=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(accepted.status,201);
+ // A timed-out provider CREATE is searchable and recoverable without another POST.
+ const uncertainToken=randomUUID(),beforeUncertain=messages.size;createTimeout=true;
+ const uncertain=await call(studio.POST,{data:base,token:uncertainToken});createTimeout=false;
+ assert.equal(uncertain.status,502);assert.equal(uncertain.data.creation.token,uncertainToken);assert.equal(messages.size,beforeUncertain+1);
+ assert.equal((await call(studio.POST,{data:base,token:uncertainToken})).status,409);assert.equal(messages.size,beforeUncertain+1);
+ const uncertainState=await call(studio.GET,undefined);assert.ok(uncertainState.data.pendingCreates.some(item=>item.token===uncertainToken));assert.ok(uncertainState.data.operations.some(item=>item.kind==='draft_create'&&item.status==='unknown'));
+ assert.equal((await call(recover.POST,{token:uncertainToken},'/api/recover','https://evil.example')).status,403);
+ listShape='unexpected';assert.equal((await call(recover.POST,{token:uncertainToken})).status,502);listShape='wrapped';
+ const uncertainId=String(nextId-1),untampered=structuredClone(messages.get(uncertainId));messages.get(uncertainId).htmlText=messages.get(uncertainId).htmlText.replace('Hello','Changed');
+ assert.equal((await call(recover.POST,{token:uncertainToken})).status,409);messages.set(uncertainId,untampered);
+ const duplicateId=String(nextId++);messages.set(duplicateId,{...untampered,id:duplicateId});
+ assert.equal((await call(recover.POST,{token:uncertainToken})).status,409);messages.delete(duplicateId);
+ const found=await call(recover.POST,{token:uncertainToken});assert.equal(found.status,200);assert.equal(found.data.id,uncertainId);assert.equal(messages.size,beforeUncertain+1);
+ assert.equal((await call(recover.POST,{token:uncertainToken})).status,200);assert.equal(messages.size,beforeUncertain+1);listShape='array';
+ assert.ok(!(await call(studio.GET,undefined)).data.pendingCreates.some(item=>item.token===uncertainToken));
+ createTimeout=true;const uncertainTemplateToken=randomUUID();const uncertainTemplate=await call(templates.POST,{data:base,name:'Timed out template',token:uncertainTemplateToken});createTimeout=false;
+ assert.equal(uncertainTemplate.status,502);assert.equal(uncertainTemplate.data.creation.template,true);assert.equal((await call(recover.POST,{token:uncertainTemplateToken})).status,404);
+ assert.equal((await call(recover.POST,{token:uncertainTemplateToken,template:true})).status,200);
  // The provider may create a letter before final status persistence fails.
  // It must remain readable and recover only its own unfinished CREATE.
  failFinalize=true;const recoveryToken=randomUUID();const beforePartial=messages.size;
@@ -100,7 +118,7 @@ try{
  assert.equal((await call(recover.POST,{id:orphanId})).status,409);
  assert.equal((await call(studio.POST,{data:base,token:recoveryToken})).data.id,orphanId);
  missingEtag=true;const etagFailure=await call(studio.POST,{data:base,token:randomUUID()});assert.equal(etagFailure.status,503);assert.match(etagFailure.data.error,/BLOB_ETAG_MISSING/);missingEtag=false;
- const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.3');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
+ const beforeDiagnostic=messages.size;const diagnostic=await call(diagnostics.POST,{});assert.equal(diagnostic.status,200);assert.equal(diagnostic.data.ok,true);assert.equal(diagnostic.data.build.version,'0.2.4');assert.equal(probes.size,0);assert.equal(messages.size,beforeDiagnostic);
  const beforeTemplates=messages.size;const template=await call(templates.POST,{data:base,name:'Reusable',token:randomUUID()});assert.equal(template.status,201);assert.equal(messages.get(template.data.id).template,true);const original=structuredClone(messages.get(template.data.id));const chosen=await call(remote.POST,{id:template.data.id});assert.equal(chosen.status,200);assert.deepEqual(messages.get(template.data.id),original);assert.equal(messages.size,beforeTemplates+1);
  assert.equal((await call(review.POST,{id})).status,400);
  const tests=await Promise.all([call(test.POST,{id}),call(test2.POST,{id})]);assert.ok(tests.some(x=>x.status===200));assert.equal(testCalls,1);assert.equal((await call(test.POST,{id})).data.already,true);

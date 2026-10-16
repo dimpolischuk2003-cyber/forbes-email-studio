@@ -2,12 +2,12 @@ import {cookies} from 'next/headers';
 import {z} from 'zod';
 import {currentUser,cookieOptions} from './auth';
 import {sign,verify} from './tokens';
-import {AppError,DraftSaveError} from './errors';
+import {AppError,DraftSaveError,DraftPendingError} from './errors';
 import {defaultFooter,type Footer} from './email';
 import {STUDIO_VERSION} from './build';
 export {AppError} from './errors';
 export async function actor(request?:Request){const user=await currentUser();if(!user)throw new AppError('Увійдіть до Email Studio.',401);if(request&&request.method!=='GET'&&request.headers.get('origin')!==new URL(request.url).origin)throw new AppError('Недійсний запит. Оновіть сторінку.',403);return user;}
-export function failure(e:unknown){const requestId=crypto.randomUUID();if(e instanceof AppError){if(e.status>=500)console.error('studio.request',JSON.stringify({requestId,status:e.status,message:e.message}));return json({error:e.message,requestId,...(e instanceof DraftSaveError?{draft:{id:e.messageId,status:'unknown'}}:{})},e.status);}if(e instanceof z.ZodError)return json({error:'Перевірте введені поля.',fields:e.issues.map(x=>x.path.join('.')),requestId},400);console.error('studio.request',JSON.stringify({requestId,status:500,kind:e instanceof Error?e.name:'unknown'}));return json({error:'Не вдалося виконати дію. Ваш текст залишився у редакторі.',requestId},500);}
+export function failure(e:unknown){const requestId=crypto.randomUUID();if(e instanceof AppError){if(e.status>=500)console.error('studio.request',JSON.stringify({requestId,status:e.status,message:e.message}));return json({error:e.message,requestId,...(e instanceof DraftSaveError?{draft:{id:e.messageId,status:'unknown'}}:{}),...(e instanceof DraftPendingError?{creation:{token:e.token,template:e.template}}:{})},e.status);}if(e instanceof z.ZodError)return json({error:'Перевірте введені поля.',fields:e.issues.map(x=>x.path.join('.')),requestId},400);console.error('studio.request',JSON.stringify({requestId,status:500,kind:e instanceof Error?e.name:'unknown'}));return json({error:'Не вдалося виконати дію. Ваш текст залишився у редакторі.',requestId},500);}
 export function json(data:unknown,status=200){return Response.json(data,{status,headers:{'Cache-Control':'no-store','X-Studio-Version':STUDIO_VERSION}});}
 export async function payload(request:Request){if(Number(request.headers.get('content-length'))>600000)throw new AppError('Запит завеликий.',413);const t=await request.text();if(Buffer.byteLength(t)>600000)throw new AppError('Запит завеликий.',413);try{return JSON.parse(t);}catch{throw new AppError('Невірний формат запиту.');}}
 export async function hash(data:unknown){const bytes=await crypto.subtle.digest('SHA-256',new TextEncoder().encode(JSON.stringify(data)));return Buffer.from(bytes).toString('hex');}

@@ -5,7 +5,7 @@ import type {Stats} from './statistics';
 export type Receipt={id:string;kind:string;status:string;data:Record<string,unknown>;created_at:string};
 export type RecordState={id:string;kind:'campaign'|'template';revision:number;fingerprint:string;status:string;testedHash:string|null;test?:{hash:string;status:string;operation:string};broadcastId:string|null;sendMessageId?:string;operation?:string;updatedAt:string;stats?:Stats};
 export type ImportState={id:string;name:string;status:string;sessions:string[];count:number;failed:number;groupName:string;groupId:number|null;updatedAt:string};
-export type ControlState={version:1;binding?:string;writes?:string[];records:Record<string,RecordState>;imports:Record<string,ImportState>;operations:Receipt[];creates:Record<string,{status:string;id?:string;operation:string;hash?:string}>};
+export type ControlState={version:1;binding?:string;writes?:string[];records:Record<string,RecordState>;imports:Record<string,ImportState>;operations:Receipt[];creates:Record<string,{status:string;id?:string;operation:string;hash?:string;name?:string;actor?:string;createdAt?:string}>};
 const empty=():ControlState=>({version:1,records:{},imports:{},operations:[],creates:{}});
 // Blob SDK resolves Vercel OIDC from request context as well as environment variables.
 // A connected store ID is sufficient here; authenticated reads/writes still fail closed.
