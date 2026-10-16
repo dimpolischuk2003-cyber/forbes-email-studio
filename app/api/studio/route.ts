@@ -2,11 +2,11 @@ export const runtime='nodejs';
 export const maxDuration=300;
 import {actor,config,apiKey,esputnik,failure,json,payload,AppError} from '@/lib/server';
 import {controlRead,controlChange,controlAvailable,log} from '@/lib/control';
-import {listedMessages,loadedCampaign,recordRow,createMessage,encodeMessage,readMessage,messageId} from '@/lib/messages';
+import {listedMessages,loadedCampaign,recordRow,createMessage,encodeMessage,readMessage,messageId,draftRecoveryReview} from '@/lib/messages';
 import {campaignSchema,emptyCampaign} from '@/lib/email';
 import {canonicalCampaign} from '@/lib/sanitize';
 import {z} from 'zod';
-export async function GET(request:Request){try{const u=await actor();const {config:f}=await config(u.email);const id=new URL(request.url).searchParams.get('id');if(id){const p=await loadedCampaign(messageId.parse(id));return json({...recordRow(p.record,p.data),recoverable:p.recoverable});}
+export async function GET(request:Request){try{const u=await actor();const {config:f}=await config(u.email);const id=new URL(request.url).searchParams.get('id');if(id){const p=await loadedCampaign(messageId.parse(id));const recoveryReview=p.recoverable?await draftRecoveryReview(p.remote,f,u.email):null;return json({...recordRow(p.record,p.data),recoverable:!!recoveryReview,recoveryReview});}
  const connected=!!process.env.ESPUTNIK_API_KEY;const ready=connected&&controlAvailable();const state=ready?(await controlRead()).state:null;const list=connected?await listedMessages():{rows:[]};const campaigns=[],templates=[];
  for(const row of list.rows){const r=state?.records[row.id];const value={id:row.id,name:row.name,data:{...emptyCampaign,name:row.name,subject:row.subject},revision:r?.revision||1,status:r?.status||'unknown',message_id:row.id,broadcast_id:r?.broadcastId||null,updated_at:r?.updatedAt||row.updatedAt};if(row.template||r?.kind==='template')templates.push(value);else campaigns.push(value);}
  if(state)for(const r of Object.values(state.records)){if(list.rows.some(x=>x.id===r.id))continue;const value=recordRow(r,{...emptyCampaign,name:'Лист eSputnik #'+r.id});if(r.kind==='template')templates.push(value);else campaigns.push(value);}

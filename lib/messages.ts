@@ -13,12 +13,13 @@ export async function readMessage(id:string):Promise<Remote>{messageId.parse(id)
 export async function encodeMessage(c:Campaign,f:Config,template=false){const html=renderEmail(c,f);const meta=sign('editor',{data:c,htmlHash:await hash(html)});return {name:c.name||'Без назви',from:`"${f.senderName}" <${f.senderEmail}>`,subject:c.subject||'Без теми',htmlText:html+`<!--forbes-studio-v2:${meta}-->`,languageCode:'uk',tags:[TAG],subscriptionsKeys:f.subscriptionsKeys,template};}
 export async function decodeMessage(r:Remote){const tokens=Array.from(r.html.matchAll(marker));const html=r.html.replace(marker,'');if(tokens.length===1){const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);if(meta&&meta.htmlHash===await hash(html)){const parsed=campaignSchema.safeParse(meta.data);if(parsed.success&&r.name===(parsed.data.name||'Без назви')&&r.subject===(parsed.data.subject||'Без теми'))return canonicalCampaign(parsed.data);}}
  if(html.length>350000)throw new AppError('Лист завеликий для редактора MVP.');return canonicalCampaign(campaignSchema.parse({...emptyCampaign,name:r.name.slice(0,200),subject:r.subject.slice(0,200),imported_html:html,template_source:`eSputnik #${r.id}`,utm_enabled:false}));}
-/** Only explicit list envelopes are supported; recovery still verifies each letter. */
+/** eSputnik can return a single ID object for a one-result search. */
 function messageRows(data:unknown,depth=0):Record<string,unknown>[]|null{
  if(Array.isArray(data))return data.filter((row):row is Record<string,unknown>=>!!row&&typeof row==='object'&&!Array.isArray(row));
  if(!data||typeof data!=='object'||depth>2)return null;
  for(const key of ['messages','emails','items','data','content','results']){const rows=messageRows((data as Record<string,unknown>)[key],depth+1);if(rows)return rows;}
- return null;
+ const item=data as Record<string,unknown>;
+ return messageId.safeParse(item.id).success?[item]:null;
 }
 export async function listedMessages(search=TAG,start=1){
  const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=${start}&maxrows=50&search=${encodeURIComponent(search)}`);
@@ -46,9 +47,9 @@ async function recoveryContext(r:Remote,f:Config){
  const key=creationKey(r);if(!key)return null;
  const tokens=Array.from(r.html.matchAll(marker));if(tokens.length!==1)return null;
  const meta=verify<{data:Campaign;htmlHash:string}>('editor',tokens[0][1]);
- if(!meta||meta.htmlHash!==await hash(r.html.replace(marker,'')))return null;
+ if(!meta||typeof meta.htmlHash!=='string')return null;
  const parsed=campaignSchema.safeParse(meta.data);if(!parsed.success||r.name!==(parsed.data.name||'Без назви')||r.subject!==(parsed.data.subject||'Без теми'))return null;
- const data=canonicalCampaign(parsed.data);return {key,data,hash:await hash({c:data,f,template:r.template})};
+ const data=canonicalCampaign(parsed.data);return {key,data,hash:await hash({c:data,f,template:r.template}),htmlChanged:meta.htmlHash!==await hash(r.html.replace(marker,''))};
 }
 /** Read-only evidence for failed recovery. Never returns HTML, tokens or settings. */
 export async function diagnoseDraft(id:string,f:Config){
@@ -83,18 +84,32 @@ export async function diagnoseDraft(id:string,f:Config){
  }catch(e){search={attempted:true,failed:true,status:e instanceof AppError?e.status:502};}}
  return {messageId:id,reason,checks,search};
 }
-export async function recoverDraft(id:string,f:Config,actor:string){
+type RecoveryProof={id:string;fingerprint:string;key:string;hash:string;actor:string;expiresAt:number};
+export async function draftRecoveryReview(remote:Remote,f:Config,actor:string){
+ const context=await recoveryContext(remote,f);if(!context)return null;
+ const {state}=await controlRead();const pending=state.creates[context.key];
+ if(state.records[remote.id]||!pending||!['creating','unknown'].includes(pending.status)||pending.hash!==context.hash||(pending.id&&pending.id!==remote.id))return null;
+ const proof:RecoveryProof={id:remote.id,fingerprint:remote.fingerprint,key:context.key,hash:context.hash,actor,expiresAt:Date.now()+10*60*1000};
+ return {token:sign('draft-recovery',proof),htmlChanged:context.htmlChanged};
+}
+export async function recoverDraft(id:string,f:Config,actor:string,accept?:{confirmed:boolean;token:string}){
  const remote=await readMessage(messageId.parse(id));const recovery=await recoveryContext(remote,f);
  if(!recovery)throw new AppError('Походження цієї чернетки не підтверджено. Її можна переглянути, але відновлення статусу заблоковано.',409);
+ if(recovery.htmlChanged||accept){
+  const proof=accept?.confirmed?verify<RecoveryProof>('draft-recovery',accept.token):null;
+  if(!proof||proof.id!==id||proof.fingerprint!==remote.fingerprint||proof.key!==recovery.key||proof.hash!==recovery.hash||proof.actor!==actor||!Number.isFinite(proof.expiresAt)||proof.expiresAt<=Date.now())throw new AppError('HTML листа відрізняється або підтвердження застаріло. Відкрийте лист знову, перегляньте версію eSputnik і підтвердьте її відновлення.',409);
+ }
+ // Validate the actual remote content before recording an editable draft.
+ // Changed HTML stays imported HTML; signed editor data never replaces it.
+ await decodeMessage(remote);
  await controlChange(s=>{
   if(s.records[id])throw new AppError('Службовий запис уже існує. Відкрийте останню версію кампанії.',409);
   const pending=s.creates[recovery.key];
   if(!pending||!['creating','unknown'].includes(pending.status)||pending.hash!==recovery.hash||(pending.id&&pending.id!==id))throw new AppError('Немає відповідної незавершеної операції створення. Відновлення статусу заблоковано.',409);
-  // Only an unfinished CREATE may recover to draft. Tests and launches are
-  // separate operations and can never be reset by this action.
+  // Only unfinished CREATE can recover. Tests and launches are never reset.
   s.creates[recovery.key]={...pending,id,status:'saved'};
   s.records[id]={id,kind:remote.template?'template':'campaign',revision:1,fingerprint:remote.fingerprint,status:'draft',testedHash:null,broadcastId:null,updatedAt:new Date().toISOString()};
-  log(s,'draft_recovered','saved',{actor,name:remote.name,messageId:id});
+  log(s,'draft_recovered','saved',{actor,name:remote.name,messageId:id,acceptedRemoteHtml:recovery.htmlChanged});
  });
  return {id,revision:1};
 }
@@ -112,16 +127,19 @@ export async function findCreatedDraft(token:string,template:boolean,f:Config,ac
  let ids:string[]=[];
  if(pending.id)ids=[messageId.parse(pending.id)];
  else{
-  const {data}=await esputnik(await apiKey(),`/messages/email?startindex=1&maxrows=50&search=${encodeURIComponent('studio-'+token)}`);
+  const {data,headers}=await esputnik(await apiKey(),`/messages/email?startindex=1&maxrows=50&search=${encodeURIComponent('studio-'+token)}`);
   const rows=messageRows(data);
   if(!rows)throw new AppError('eSputnik не повернув список для перевірки. Збереження залишається непідтвердженим; новий лист не створювався.',502);
+  const total=headers.get('TotalCount');
+  if(total&&/^\d+$/.test(total)&&Number(total)>rows.length)throw new AppError('Пошук повернув неповний список. Автоматичне відновлення заблоковане до перевірки всіх збігів.',409);
   ids=[...new Set(rows.map(row=>messageId.safeParse(row.id)).filter(result=>result.success).map(result=>result.data!))];
   if(ids.length>10)throw new AppError('Пошук eSputnik повернув забагато листів. Потрібна перевірка у кабінеті; повторне створення заблоковане.',409);
  }
- const matches:string[]=[];
- for(const id of ids){const remote=await readMessage(id);const context=await recoveryContext(remote,f);if(context?.key===key&&context.hash===pending.hash)matches.push(id);}
+ const matches:{id:string;htmlChanged:boolean}[]=[];
+ for(const id of ids){const remote=await readMessage(id);const context=await recoveryContext(remote,f);if(context?.key===key&&context.hash===pending.hash)matches.push({id,htmlChanged:context.htmlChanged});}
  if(matches.length!==1)throw new AppError(matches.length?'Знайдено кілька відповідних листів. Автоматичне відновлення заблоковане.':'eSputnik поки не підтвердив створення цього листа. Можна перевірити пізніше або переглянути кабінет eSputnik. Повторне створення не запускалося.',409);
- return recoverDraft(matches[0],f,actor);
+ if(matches[0].htmlChanged)return {id:matches[0].id,revision:1,needsReview:true};
+ return recoverDraft(matches[0].id,f,actor);
 }
 export async function createMessage(c:Campaign,f:Config,token:string,actor:string,template=false){
  z.string().uuid().parse(token);const key=(template?'template:':'draft:')+token;const op=crypto.randomUUID();let createdId:string|undefined,claimed=false,stage='створення листа';

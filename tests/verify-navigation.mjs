@@ -22,10 +22,20 @@ const adapters={name:'ui-isolation',setup(b){
 const outfile=join(directory,'studio.cjs');await build({entryPoints:['components/studio.tsx'],outfile,bundle:true,platform:'node',format:'cjs',packages:'external',jsx:'automatic',plugins:[adapters],logLevel:'silent'});
 const Studio=require(outfile).default;
 const config={senderName:'Forbes',senderEmail:'news@example.com',address:'Kyiv',unsubscribe:'https://example.com/unsubscribe',testEmail:'user@example.com',accountTimezone:'Europe/Kyiv',timezoneConfirmed:true,enabled:false,subscriptionsKeys:[]};
-let draftPosts=0,recoveryPosts=0,releaseSave,submitted,saved=false;
+let draftPosts=0,recoveryPosts=0,releaseSave,submitted,saved=false,changedFlow=false,acceptedRemote=false,remoteAccepts=0;
 function record(){return {id:'123',name:submitted?.data.name||'Saved',data:submitted?.data,revision:1,status:'draft',message_id:'123',broadcast_id:null,updated_at:new Date().toISOString()};}
 const store=()=>({user:{name:'Tester',email:'user@example.com'},campaigns:saved?[record()]:[],templates:[],operations:[],pendingCreates:!saved&&submitted?[{token:submitted.token,template:false,name:submitted.data.name,status:'unknown'}]:[],config,connections:{esputnik:true}});
 globalThis.fetch=async(url,options={})=>{
+ if(changedFlow){
+  const remoteData={...submitted.data,imported_html:'<html><body><p>Provider version shown for review</p></body></html>',blocks:[],subject:'Provider version'};
+  const row={id:'4731919',name:'Existing letter',data:remoteData,revision:1,status:acceptedRemote?'draft':'unknown',message_id:'4731919',broadcast_id:null,updated_at:new Date().toISOString(),recoverable:!acceptedRemote,recoveryReview:acceptedRemote?null:{token:'review-token-from-get',htmlChanged:true}};
+  if(url==='/api/studio')return Response.json({...store(),campaigns:[row],pendingCreates:acceptedRemote?[]:[{token:'pending-token',template:false,name:'Existing letter'}]});
+  if(url==='/api/studio?id=4731919')return Response.json(row);
+  if(url==='/api/segments')return Response.json({segments:[]});
+  if(url==='/api/recover'&&options.method==='POST'){const body=JSON.parse(options.body);if(body.token){assert.equal(body.token,'pending-token');return Response.json({id:'4731919',revision:1,needsReview:true});}assert.deepEqual(body,{id:'4731919',acceptRemoteHtml:true,recoveryToken:'review-token-from-get'});acceptedRemote=true;remoteAccepts++;return Response.json({id:'4731919',revision:1});}
+  throw new Error('Unexpected recovery UI request: '+url);
+ }
+
  if(url==='/api/studio'&&options.method==='POST'){draftPosts++;submitted=JSON.parse(options.body);return new Promise(resolve=>{releaseSave=()=>resolve(Response.json({error:'Create acknowledgement timed out',creation:{token:submitted.token,template:false}},{status:502}));});}
  if(url==='/api/recover'&&options.method==='POST'){recoveryPosts++;assert.equal(JSON.parse(options.body).token,submitted.token);saved=true;return Response.json({id:'123',revision:1});}
  if(url==='/api/studio')return Response.json(store());
@@ -53,5 +63,15 @@ try{
  await click(sidebar('Кампанії'));assert.equal(document.querySelector('h1').textContent,'Кампанії');assert.equal(draftPosts,1);
  await click(button('Відкрити'));assert.equal(document.querySelector('h1').textContent,'Кампанії');
  await click(sidebar('Створити лист'));assert.equal(document.querySelector('input[placeholder="Тема, яку побачить читач"]').value,'Keep this unsaved edit');
+ // Provider-transformed HTML is shown before an explicit, cancelable acceptance.
+ await act(async()=>{root.render(null);});changedFlow=true;
+ await act(async()=>{root.render(React.createElement(Studio));});
+ await click(sidebar('Кампанії'));await click(button('Перевірити збереження'));
+ assert.ok(document.body.textContent.includes('HTML відрізняється від початкового'));
+ assert.ok(document.querySelector('iframe').srcdoc.includes('Provider version shown for review'));
+ assert.equal(document.querySelector('input[placeholder="Тема, яку побачить читач"]').disabled,true);
+ const postsBeforeAcceptance=draftPosts;window.confirm=()=>false;await click(button('Прийняти версію eSputnik'));assert.equal(remoteAccepts,0);
+ let confirmation='';window.confirm=text=>{confirmation=text;return true;};await click(button('Прийняти версію eSputnik'));assert.equal(remoteAccepts,1);assert.match(confirmation,/новий тест/);assert.equal(draftPosts,postsBeforeAcceptance);
+ assert.equal(document.querySelector('input[placeholder="Тема, яку побачить читач"]').disabled,false);assert.ok(document.querySelector('iframe').srcdoc.includes('Provider version shown for review'));assert.ok(document.body.textContent.includes('Версію eSputnik відновлено як чернетку'));
  console.log('PASS: real React DOM events, dirty navigation without POST, navigation during pending save, timeout handling, editor retention, read-only recovery action, no duplicate create, cancellation preserves unsaved edits. Child editors are isolated; no browser rendering is claimed.');
 }finally{await act(async()=>root.unmount());dom.window.close();await rm(directory,{recursive:true,force:true});}
