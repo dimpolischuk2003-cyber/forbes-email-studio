@@ -1,0 +1,31 @@
+import assert from 'node:assert/strict';
+import {build} from 'esbuild';
+import {mkdir,rm} from 'node:fs/promises';
+import {pathToFileURL} from 'node:url';
+import {join} from 'node:path';
+const directory=join(process.cwd(),'.test-editor');await mkdir(directory,{recursive:true});
+try{
+ const outfile=join(directory,'helpers.mjs');await build({stdin:{contents:"export * from './lib/email';export * from './lib/sanitize';export * from './lib/responsive-email';export * from './lib/images';",resolveDir:process.cwd(),loader:'ts'},outfile,bundle:true,platform:'node',format:'esm',packages:'external',logLevel:'silent'});
+ const {campaignSchema,emptyCampaign,newBlock,renderEmail,canonicalCampaign,campaignLinks,validateForSend,responsiveEmail,driveImageUrl,imageType,readImageBytes,MAX_IMAGE_BYTES}=await import(pathToFileURL(outfile));
+ const text={...newBlock('text'),text:'Body',html:'<p>Body <font color="#ff0000" face="Verdana">red</font> <span style="border:1px solid #cccccc;padding:2px 5px">framed</span></p>',fontFamily:'Verdana',borderWidth:2,borderColor:'#abcdef',padding:16};
+ const image={...newBlock('image'),url:'https://example.com/banner.png',imageLink:'https://example.com/article'};
+ const button={...newBlock('button'),text:'Register',url:'https://example.com/register',align:'right',buttonTextAlign:'center'};
+ const line={...newBlock('divider'),borderWidth:3,dividerWidth:60,dividerStyle:'dashed',borderColor:'#abcdef'};
+ const c=campaignSchema.parse({...emptyCampaign,name:'Event',subject:'Subject',theme:'dark',utm_enabled:true,utm_campaign:'event',blocks:[text,image,button,line]});
+ const f={senderName:'Forbes',senderEmail:'support@example.com',address:'Contact text',unsubscribe:'',logoUrl:'https://example.com/brand.png',footerLinks:[{label:'Instagram',url:'https://example.com/social'}]};
+ const html=renderEmail(c,f);assert.ok(html.includes('background-color:#171717'));assert.ok(html.includes('width:100%;max-width:600px;table-layout:fixed'));assert.ok(html.includes('supported-color-schemes'));assert.ok(html.includes('prefers-color-scheme:dark'));assert.ok(html.includes('border:2px solid #abcdef'));assert.ok(html.includes('font-family:\'Verdana\''));assert.ok(html.includes('width:60%'));assert.ok(html.includes('border-top:3px dashed #abcdef'));assert.ok(html.includes('brand.png'));assert.ok(html.indexOf('Register')<html.indexOf('data-studio-footer'));assert.ok(html.includes('Instagram'));
+ const buttonLink=/<a href="https:\/\/example.com\/register[^>]+>Register<\/a>/.exec(html)?.[0];assert.ok(buttonLink?.includes('display:block;padding:15px 24px'));assert.ok(buttonLink.includes('text-align:center'));
+ assert.ok(html.includes('<a href="https://example.com/article?utm_source=esputnik&amp;utm_medium=email&amp;utm_campaign=event" target="_blank" style="display:block;text-decoration:none"><img'));
+ assert.ok(campaignLinks(c).some(link=>link.includes('/article?')));assert.deepEqual(validateForSend(c,f),[]);
+ const clean=canonicalCampaign(c);assert.ok(clean.blocks[0].html.includes('color="#ff0000"'));assert.ok(clean.blocks[0].html.includes('face="Verdana"'));assert.ok(clean.blocks[0].html.includes('border:1px solid'));assert.ok(canonicalCampaign({...c,imported_html:html}).imported_html.includes('name="color-scheme"'));
+ assert.equal(campaignSchema.safeParse({...c,blocks:[{...text,fontFamily:'Arial; background:url(evil)'}]}).success,false);
+ assert.ok(validateForSend({...c,blocks:[{...image,url:'https://drive.google.com/file/d/abcdefghijk/view'},text]},f).some(v=>v.includes('Google Drive')));
+ const before='<html><body><table width="600" style="width:600px;min-width:600px;background:#fff"><tr><td><img width="536" style="height:300px" src="https://example.com/a.png"><a href="https://example.com/unsubscribe">Unsubscribe</a></td></tr></table></body></html>';
+ const after=responsiveEmail(before);assert.ok(!after.includes('min-width:600px'));assert.ok(after.includes('max-width:600px'));assert.ok(after.includes('height:auto'));assert.ok(after.includes('<a href="https://example.com/unsubscribe">Unsubscribe</a>'));assert.equal(responsiveEmail(after),after);
+ const url=driveImageUrl('https://drive.google.com/file/d/abcdefghijk/view?resourcekey=key123');assert.equal(url.searchParams.get('id'),'abcdefghijk');assert.equal(url.searchParams.get('resourcekey'),'key123');
+ assert.throws(()=>driveImageUrl('https://127.0.0.1/file/d/abcdefghijk'));assert.throws(()=>imageType(Buffer.from('<svg>bad</svg>')));
+ const png=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1sAAAAASUVORK5CYII=','base64');assert.equal(imageType(png).mime,'image/png');assert.deepEqual(await readImageBytes(new Response(png)),png);
+ await assert.rejects(()=>readImageBytes(new Response(png,{headers:{'content-length':String(MAX_IMAGE_BYTES+1)}})),/завелике/);
+ const stream=new ReadableStream({start(controller){controller.enqueue(new Uint8Array(MAX_IMAGE_BYTES));controller.enqueue(new Uint8Array(1));controller.close();}});await assert.rejects(()=>readImageBytes(new Response(stream)),/завелике/);
+ console.log('PASS: editable font/color/frame persistence, dark and responsive markup, linked banners with UTM, full-area button links, footer order, preserved system links, image signatures, import boundaries and byte limits.');
+}finally{await rm(directory,{recursive:true,force:true});}

@@ -1,0 +1,8 @@
+'use client';
+import {useState} from 'react';
+import {isDriveUrl} from '@/lib/email';
+export function ImageSource({value,disabled,onChange}:{value:string;disabled:boolean;onChange:(url:string)=>void}){
+ const [busy,setBusy]=useState(false),[error,setError]=useState('');
+ async function upload(file?:File){if(busy)return;setBusy(true);setError('');try{let body:FormData|string,headers:Record<string,string>|undefined;if(file){if(file.size>3*1024*1024)throw new Error('Максимальний розмір — 3 МБ.');body=new FormData();body.set('file',file);}else{body=JSON.stringify({driveUrl:value});headers={'Content-Type':'application/json'};}const response=await fetch('/api/images',{method:'POST',body,headers});const data=await response.json();if(!response.ok)throw new Error(data.error||'Не вдалося завантажити картинку.');onChange(data.url);}catch(e){setError(e instanceof Error?e.message:'Не вдалося завантажити картинку.');}finally{setBusy(false);}}
+ return <div className="image-source"><label className="field"><span>Адреса зображення</span><input type="url" disabled={disabled||busy} value={value} placeholder="https://…" onChange={e=>onChange(e.target.value)}/><small>Пряме посилання з галереї eSputnik чи сайту або імпорт файлу з Google Drive.</small></label><label className="file-input">{busy?'Завантажуємо…':'Завантажити з комп’ютера · до 3 МБ'}<input type="file" accept="image/png,image/jpeg,image/gif,image/webp" disabled={disabled||busy} onChange={e=>{const file=e.target.files?.[0];if(file)void upload(file);e.target.value='';}}/></label>{isDriveUrl(value)&&<button className="button secondary" disabled={disabled||busy} onClick={()=>upload()}>Імпортувати з Google Drive</button>}{error&&<p className="local-error" role="alert">{error}</p>}</div>;
+}
