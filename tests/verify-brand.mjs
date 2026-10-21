@@ -7,11 +7,13 @@ import {join} from 'node:path';
 const dir=join(process.cwd(),'.test-brand');await mkdir(dir,{recursive:true});
 try{
  const out=join(dir,'brand.mjs');await build({stdin:{contents:"export * from './lib/email';export * from './lib/brand';export * from './lib/brand-email';export * from './lib/responsive-email';export * from './lib/sanitize';",resolveDir:process.cwd(),loader:'ts'},outfile:out,bundle:true,platform:'node',format:'esm',packages:'external',logLevel:'silent'});
- const {renderEmail,emptyCampaign,brandLogoUrl,brandSocialLinks,stableBannerUrl,legacyBannerSource,brandExistingStudioEmail,responsiveEmail,canonicalCampaign}=await import(pathToFileURL(out));
+ const {renderEmail,emptyCampaign,brandLogoUrl,brandSocialLinks,stableBannerUrl,legacyBannerSource,brandExistingStudioEmail,responsiveEmail,canonicalCampaign,socialIconUrl}=await import(pathToFileURL(out));
  const f={senderName:'Forbes Україна',senderEmail:'events_contact@forbes.ua',address:'',unsubscribe:''};
  const c={...emptyCampaign,name:'Magazine',subject:'Magazine',headline:'Offer',body:'Text',button_text:'Register',button_url:'https://example.com/register',utm_enabled:false};
  const native=renderEmail(c,f);assert.ok(native.includes(`src="${brandLogoUrl}"`));assert.ok(native.includes('bgcolor="#101010"'));assert.ok(native.includes('mailto:support@forbes.ua'));assert.ok(native.includes('Ви отримали цю розсилку, тому що є читачем Forbes Ukraine'));
- for(const link of brandSocialLinks)assert.ok(native.includes(`href="${link.url}"`));
+ for(const link of brandSocialLinks){assert.ok(native.includes(`href="${link.url}"`));const icon=socialIconUrl(link.url);assert.ok(icon);assert.ok(native.includes(`src="${icon}"`));assert.ok(native.includes(`alt="${link.label}"`));assert.ok(!native.includes(`>${link.label}</a>`));const bytes=await readFile('public'+new URL(icon).pathname);assert.equal(bytes.subarray(0,8).toString('hex'),'89504e470d0a1a0a');}
+ assert.equal(socialIconUrl('https://instagram.com.evil.example/a'),null);assert.equal(socialIconUrl('https://example.com/instagram.com'),null);
+ assert.ok(renderEmail(c,{...f,footerLinks:[{label:'Website',url:'https://example.com/'}]}).includes('>Website</a>'));
  assert.ok(!native.includes('href="#"'));assert.ok(!native.includes('tov-ujavi.esclick.me'));assert.ok(!native.includes('Керувати підписками або відписатися')); // No fake personal unsubscribe URL.
  const legacy=await readFile('tests/fixtures/legacy-studio-layout.html','utf8');
  assert.ok(legacy.includes(legacyBannerSource));const fixed=renderEmail({...c,blocks:[],imported_html:legacy,preheader:'Preview'},f);

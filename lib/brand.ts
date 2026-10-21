@@ -12,3 +12,7 @@ export const brandSocialLinks=[
 export const legacyBannerSource='https://forbes.ua/static/storage/originals/4/5f/7dff0e36e44f355e76715166911cf5f4.jpg';
 export const stableBannerUrl=brandOrigin+'/brand/magazine-subscription-banner.jpg';
 export function stableImageUrl(url:string){return url===legacyBannerSource?stableBannerUrl:url;}
+
+export function socialIconUrl(value:string){
+ try{const host=new URL(value).hostname.toLowerCase().replace(/^www\./,'');const icons:Record<string,string>={'instagram.com':'instagram','facebook.com':'facebook','fb.com':'facebook','youtube.com':'youtube','youtu.be':'youtube','linkedin.com':'linkedin','telegram.me':'telegram','t.me':'telegram'};return icons[host]?brandOrigin+'/brand/social/'+icons[host]+'.png':null;}catch{return null;}
+}

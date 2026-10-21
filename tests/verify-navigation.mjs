@@ -6,7 +6,7 @@ import {join} from 'node:path';
 const require=createRequire(import.meta.url);
 const {JSDOM}=require(process.env.JSDOM_MODULE_PATH||'jsdom');
 const dom=new JSDOM('<!doctype html><html><body><div id="root"></div></body></html>',{url:'https://studio.example.com',pretendToBeVisual:true});
-for(const key of ['window','document','navigator','HTMLElement','HTMLInputElement','Event','MouseEvent'])Object.defineProperty(globalThis,key,{value:dom.window[key],configurable:true});
+for(const key of ['window','document','navigator','HTMLElement','HTMLInputElement','HTMLSelectElement','Event','MouseEvent'])Object.defineProperty(globalThis,key,{value:dom.window[key],configurable:true});
 globalThis.IS_REACT_ACT_ENVIRONMENT=true;window.confirm=()=>false;
 const React=require('react'),{act}=React,{createRoot}=require('react-dom/client');
 const directory=join(process.cwd(),'.test-navigation');await mkdir(directory,{recursive:true});
@@ -60,6 +60,11 @@ try{
  await click(sidebar('Створити лист'));assert.equal(document.querySelector('input').value,'Unconfirmed draft retained');assert.ok(document.body.textContent.includes('Збереження потребує перевірки'));
  await click(button('Перевірити збереження'));assert.equal(recoveryPosts,1);assert.equal(draftPosts,1);assert.ok(document.body.textContent.includes('Чернетку знайдено'));
  const subject=document.querySelector('input[placeholder="Тема, яку побачить читач"]');await input(subject,'Keep this unsaved edit');
+ // Manual theme selection must control the real preview HTML in either OS theme.
+ const theme=[...document.querySelectorAll('label')].find(node=>node.textContent.includes('Оформлення листа')).querySelector('select');
+ async function chooseTheme(value){await act(async()=>{Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype,'value').set.call(theme,value);theme.dispatchEvent(new Event('change',{bubbles:true}));});return document.querySelector('iframe[title="Перегляд email"]').srcdoc;}
+ const darkPreview=await chooseTheme('dark');assert.ok(darkPreview.includes('name="color-scheme" content="dark"'));assert.ok(darkPreview.includes('bgcolor="#171717"'));
+ const lightPreview=await chooseTheme('light');assert.equal(theme.value,'light');assert.ok(lightPreview.includes('name="color-scheme" content="only light"'));assert.ok(lightPreview.includes('studio-wrap studio-surface'));assert.ok(!lightPreview.includes('.studio-surface{background-color:#171717!important}'));assert.equal(draftPosts,1);
  await click(sidebar('Кампанії'));assert.equal(document.querySelector('h1').textContent,'Кампанії');assert.equal(draftPosts,1);
  await click(button('Відкрити'));assert.equal(document.querySelector('h1').textContent,'Кампанії');
  await click(sidebar('Створити лист'));assert.equal(document.querySelector('input[placeholder="Тема, яку побачить читач"]').value,'Keep this unsaved edit');

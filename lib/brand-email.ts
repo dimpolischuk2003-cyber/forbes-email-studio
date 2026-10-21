@@ -1,11 +1,14 @@
 import {Parser} from 'htmlparser2';
-import {brandLogoUrl,brandSocialLinks} from './brand';
+import {brandLogoUrl,brandSocialLinks,socialIconUrl} from './brand';
 type BrandSettings={logoUrl?:string;footerLinks?:{label:string;url:string}[];address:string};
 const e=(v:string)=>v.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]!));
 const https=(v:string)=>{try{const u=new URL(v);return u.protocol==='https:'&&!u.username&&!u.password;}catch{return false;}};
 export function brandHeaderHtml(f:BrandSettings){const logo=f.logoUrl&&https(f.logoUrl)?f.logoUrl:brandLogoUrl;return `<img src="${e(logo)}" alt="Forbes Україна" width="180" height="45" style="display:block;width:180px;max-width:100%;height:auto;border:0;background-color:#ffffff">`;}
 export function brandFooterHtml(f:BrandSettings){
- const links=(f.footerLinks??brandSocialLinks).filter(link=>https(link.url)).map(link=>`<a href="${e(link.url)}" target="_blank" style="display:inline-block;padding:8px 12px 8px 0;color:#ffffff;font:12px/1.5 Arial,sans-serif;text-decoration:none">${e(link.label)}</a>`).join('');
+ const links=(f.footerLinks??brandSocialLinks).filter(link=>https(link.url)).map(link=>{
+  const icon=socialIconUrl(link.url);
+  return `<a href="${e(link.url)}" target="_blank" title="${e(link.label)}" style="display:inline-block;padding:10px 12px 10px 0;vertical-align:middle;color:#ffffff;font:12px/1.5 Arial,sans-serif;text-decoration:none">${icon?`<img src="${e(icon)}" alt="${e(link.label)}" width="24" height="24" style="display:block;width:24px;height:24px;max-width:24px;border:0;background-color:#101010">`:e(link.label)}</a>`;
+ }).join('');
  return `<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="width:100%;table-layout:fixed"><tr><td style="padding:0 0 16px;color:#ffffff;font:12px/1.5 Arial,sans-serif">${links}</td></tr><tr><td align="right" style="text-align:right;color:#ffffff;font:14px/1.6 Arial,sans-serif">З питань підписки на Forbes Digital<br><a href="mailto:support@forbes.ua" style="color:#ffffff;text-decoration:underline">support@forbes.ua</a></td></tr><tr><td align="center" style="padding-top:24px;text-align:center;color:#b5b5b5;font:12px/1.6 Georgia,serif">Ви отримали цю розсилку, тому що є читачем Forbes Ukraine${f.address?`<br>${e(f.address).replace(/\n/g,'<br>')}`:''}</td></tr></table>`;
 }
 export function brandFooterCell(f:BrandSettings){return `<td data-studio-footer="true" class="studio-pad" bgcolor="#101010" style="padding:24px 32px;background-color:#101010;border-top:1px solid #333333;color:#ffffff;overflow-wrap:break-word">${brandFooterHtml(f)}</td>`;}

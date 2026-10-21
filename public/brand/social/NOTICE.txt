@@ -1,0 +1,13 @@
+Social brand icons: Font Awesome Free 7.3.1 by Fonticons, Inc. (2026).
+Source: https://github.com/FortAwesome/Font-Awesome/tree/master/svgs/brands
+Icons licensed under Creative Commons Attribution 4.0:
+https://creativecommons.org/licenses/by/4.0/
+Full distribution license is in LICENSE.txt.
+
+Changes: currentColor replaced with white; SVGs rendered into 64x64 PNGs on
+#101010 for email compatibility. Original SVGs are retained in source/.
+Instagram: b393ea56fb67ba59dd95188b04ce76d8367e4dd7
+Facebook-f: c4100834fbbc38ea3cdff3d316ff5c36b0b6adf3
+YouTube: b372f7884c65460ca83b170219b9ca7030d254c1
+LinkedIn-in: 7b706c06da3f963a0a8f4e0a998df15b6b4bc03d
+Telegram: fad590b0065a29565a2c6f9ef22bc0b9e48927dc
